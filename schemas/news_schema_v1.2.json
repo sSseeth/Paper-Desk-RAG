@@ -1,0 +1,55 @@
+{
+  "schema_version": "news-research-v1.2",
+  "common_fact": {
+    "value": "any | \"UNKNOWN\"",
+    "source_url": "string",
+    "source_type": "SEC_FILING | COMPANY_IR | EVENT_FEED | MARKET_DATA",
+    "published_or_as_of": "ISO-8601 with offset",
+    "retrieved_at": "ISO-8601 with offset",
+    "confidence": "HIGH | MEDIUM | LOW",
+    "evidence_kind": "FILING | ANNOUNCEMENT | RUMOUR",
+    "notes": "string"
+  },
+  "research_record": {
+    "ticker": "string",
+    "exchange": "string",
+    "currency": "string",
+    "universe": "US_STOCK | WHEEL | ALERT_ONLY",
+    "next_earnings": "common_fact (exact date, or {earliest, latest} range, or UNKNOWN)",
+    "latest_release_date": "common_fact",
+    "ex_dividend_date": "common_fact | NOT_APPLICABLE",
+    "risk_flags": "[common_fact]",
+    "record_updated_at": "ISO-8601 with offset",
+    "verification_status": "PENDING | VERIFIED | INVALID | UNKNOWN (auto-reverts to PENDING whenever record_updated_at > verified_at)",
+    "verification_reasons": "[string]",
+    "verified_by": "Skeptic",
+    "verified_at": "ISO-8601 | null",
+    "valid_until": "ISO-8601 with offset; set to the next scheduled pre-US-session refresh, never more than 24h after retrieved_at, and cut to now on material news"
+  },
+  "wheel_card": {
+    "extends": "research_record",
+    "latest_annual_operating_cash_flow": "common_fact (amount, currency, fiscal_year_end)",
+    "thesis_evidence": "[common_fact] (production vs prototype marked in notes)",
+    "going_concern_or_bankruptcy": "common_fact (NONE | GOING_CONCERN_DOUBT | BANKRUPTCY | UNKNOWN)",
+    "eligibility_facts_only": true,
+    "paper_universe_eligible": "common_fact (true | false | UNKNOWN), matched against the guide's Wheel universe list"
+  },
+  "usable_rule": "Runner may use a record for new exposure only when verification_status == VERIFIED, verified_at >= record_updated_at, and now < valid_until. An evidence_kind RUMOUR fact can never satisfy an eligibility fact; it may only add a risk flag.",
+  "scout_alert": {
+    "ticker": "string",
+    "exchange": "string",
+    "currency": "string",
+    "local_session": "string",
+    "trigger": "PRICE_3PCT_HOUR | VOLUME_2X_WINDOW | NEWS",
+    "bar_start": "ISO-8601 with offset",
+    "bar_end": "ISO-8601 with offset",
+    "measured_value": "number | UNKNOWN",
+    "baseline": "number | UNKNOWN",
+    "group_id": "string",
+    "position_risk": "boolean",
+    "daily_alert_count": "integer",
+    "source": "common_fact",
+    "informational_only": true,
+    "note": "An alert is never a trade signal on its own; News may cut a record's valid_until to now from it."
+  }
+}
