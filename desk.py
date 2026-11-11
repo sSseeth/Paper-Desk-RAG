@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SakibPaperDesk - Alpaca PAPER-ONLY runner (guide v2, 22 Oct 2026). No live mode exists."""
+"""sSseethPaperDesk - Alpaca PAPER-ONLY runner (guide v2, 22 Oct 2026). No live mode exists."""
 import argparse, json, os, subprocess, sys, uuid
 from datetime import date
 
