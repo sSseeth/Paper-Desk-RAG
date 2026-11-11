@@ -494,7 +494,7 @@ def cmd_self_test():
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="desk.py", description="SakibPaperDesk (Alpaca PAPER only)")
+    ap = argparse.ArgumentParser(prog="desk.py", description="sSseethPaperDesk (Alpaca PAPER only)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("setup-secrets", "doctor", "self-test", "report", "snapshot", "research-check", "pause", "resume", "flatten"):
         sub.add_parser(c)

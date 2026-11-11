@@ -72,8 +72,8 @@ def write_local(root, cfg, journal, summary, session_label):
     html_path = os.path.join(d, f"report_{session_label}.html")
     body = json.dumps({"stamp": st, **summary}, indent=2, default=str)
     with open(html_path, "w", encoding="utf-8") as f:
-        f.write(f"<html><head><meta charset='utf-8'><title>SakibPaperDesk {html.escape(session_label)}</title></head>"
-                f"<body><h1>SakibPaperDesk report {html.escape(session_label)}</h1>"
+        f.write(f"<html><head><meta charset='utf-8'><title>sSseethPaperDesk {html.escape(session_label)}</title></head>"
+                f"<body><h1>sSseethPaperDesk report {html.escape(session_label)}</h1>"
                 f"<p><b>Feed profile: {html.escape(st['feed_profile'])}</b> | Option quotes: "
                 f"<b>{html.escape(st['option_quotes'])}</b> | PAPER ONLY | config {st['config_hash']}</p>"
                 f"<pre>{html.escape(redact(body))}</pre></body></html>")
