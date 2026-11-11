@@ -1,4 +1,4 @@
-"""Schema hash gate (signed v1.5), v1.5 file/record validation (version, wrapper, stale/UNKNOWN/RUMOUR, wheel card
+"""Schema hash gate (signed v1.6), v1.6 null rules, file/record validation (version, wrapper, stale/UNKNOWN/RUMOUR, wheel card
 created-at clock, both Wheel statuses), polling interval + ETag 304."""
 import base64, copy, json, os
 from datetime import datetime, timedelta, timezone
@@ -17,7 +17,7 @@ def fact(v, kind="FILING"):
 
 
 def record(**over):
-    r = {"schema_version": "news-research-v1.5", "symbol": "MU", "exchange": "NASDAQ", "currency": "USD", "universe": "WHEEL",
+    r = {"schema_version": "news-research-v1.6", "symbol": "MU", "exchange": "NASDAQ", "currency": "USD", "universe": "WHEEL",
          "next_earnings": fact({"earliest": "2026-12-17", "latest": "2026-12-17"}),
          "latest_release_date": fact("2026-09-23"), "risk_flags": [], "verification_status": "VERIFIED",
          "verification_reasons": [], "verified_by": "Skeptic", "checked_at_utc": "2026-10-28T12:00:00Z",
@@ -33,7 +33,7 @@ def record(**over):
 
 
 def wrap(*recs, **over):
-    f = {"schema_version": "news-research-v1.5", "published_at_utc": "2026-10-28T12:40:00Z", "publisher": "News",
+    f = {"schema_version": "news-research-v1.6", "published_at_utc": "2026-10-28T12:40:00Z", "publisher": "News",
          "records": list(recs)}
     f.update(over)
     return f
@@ -101,19 +101,19 @@ def test_schema_hash_states(tmp_path):
     ok, st, actual = R.schema_status(root, cfg.policy)
     cfg.policy["research"]["signed_schema_sha256"] = actual
     assert R.schema_status(root, cfg.policy)[:2] == (True, "OK")
-    assert actual == "08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30"
+    assert actual == "9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99"
 
 
-def test_shipped_policy_pins_signed_v15():
+def test_shipped_policy_pins_signed_v16():
     from conftest import ROOT
     p = json.load(open(os.path.join(ROOT, "policy.json")))
-    assert p["research"]["schema_file"] == "schemas/news_schema_v1.5.json"
-    assert p["research"]["signed_schema_sha256"] == "08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30"
+    assert p["research"]["schema_file"] == "schemas/news_schema_v1.6.json"
+    assert p["research"]["signed_schema_sha256"] == "9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99"
     assert R.schema_status(ROOT, p)[:2] == (True, "OK")
     sch = json.load(open(os.path.join(ROOT, p["research"]["schema_file"])))
     assert sch["schema_version"] == R.PINNED_SCHEMA_VERSION
     assert "ownership_card_status == VERIFIED" in sch["usable_rule"]
-    for old in ("news_schema_v1.2.json", "news_schema_v1.3.json"):        # history kept
+    for old in ("news_schema_v1.2.json", "news_schema_v1.3.json", "news_schema_v1.5.json"):        # history kept
         assert os.path.exists(os.path.join(ROOT, "schemas", old))
 
 
@@ -132,12 +132,12 @@ def _load(journal, cfg, data, path="research/t.json"):
     return R.load_records(journal, cfg, NOW)
 
 
-def test_valid_v15_file_passes(journal, cfg):
+def test_valid_v16_file_passes(journal, cfg):
     recs = _load(journal, cfg, wrap(record()))
     assert recs["MU"][0] is True and recs["MU"][2]["wheel_ok"] is True
 
 
-@pytest.mark.parametrize("over", [{"schema_version": "news-research-v1.4"}, {"schema_version": "news-research-v1.3"},
+@pytest.mark.parametrize("over", [{"schema_version": "news-research-v1.5"}, {"schema_version": "news-research-v1.4"}, {"schema_version": "news-research-v1.3"},
                                   {"publisher": "Scout"}, {"published_at_utc": "2026-10-28T12:40:00+10:00"},
                                   {"records": {"MU": 1}}])
 def test_wrong_file_version_or_wrapper_rejected(journal, cfg, over):
@@ -150,7 +150,7 @@ def test_bare_record_or_list_rejected(journal, cfg):
     assert _load(journal, cfg, [record()], "b") == {}
 
 
-@pytest.mark.parametrize("ver", ["news-research-v1.4", None])
+@pytest.mark.parametrize("ver", ["news-research-v1.5", "news-research-v1.4", None])
 def test_wrong_record_version_rejected(ver):
     r = record(schema_version=ver)
     ok, errs, out = v(r)
@@ -260,8 +260,9 @@ def test_v15_closed_the_page18_gaps():
     assert "card_created_at_utc" in R.WHEEL_REQ and "ocf_filing_date" in R.WHEEL_REQ and "schema_version" in R.REC_REQ
 
 
-# ---- News's real bridge test file (copied verbatim: tests/fixtures/news_bridge_test_v15.json) ----
-FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v15.json")
+# ---- News's bridge test file as v1.6 (tests/fixtures/news_bridge_test_v16.json: the v1.5 file with only
+# schema_version changed). Its UNKNOWN facts carry null source fields, which v1.6 allows. ----
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v16.json")
 FACTS_REC = ("next_earnings", "latest_release_date", "dividend")
 FACTS_CARD = ("latest_annual_operating_cash_flow", "ocf_filing_date", "paper_universe_eligible",
               "going_concern_flag", "bankruptcy_flag")
@@ -269,12 +270,9 @@ NULL_KEYS = ("source_type", "evidence_kind", "source_url", "published_or_as_of_u
 
 
 def _expected_bridge_codes():
-    rec = ["TEST_FILE", "NOT_VERIFIED:PENDING", "SCHEMA_INVALID:verified_by"]
-    for f in FACTS_REC:
-        rec += [f"SCHEMA_INVALID:{f}.{k}" for k in NULL_KEYS] + ([f"FACT_UNKNOWN:{f}"] if f != "dividend" else [])
-    card = []
-    for f in FACTS_CARD:
-        card += [f"SCHEMA_INVALID:{f}.{k}" for k in NULL_KEYS] + [f"FACT_UNKNOWN:{f}"]
+    # v1.6: null source fields on UNKNOWN facts and a null verified_by (verified_at_utc null) are allowed
+    rec = ["TEST_FILE", "NOT_VERIFIED:PENDING"] + [f"FACT_UNKNOWN:{f}" for f in FACTS_REC if f != "dividend"]
+    card = [f"FACT_UNKNOWN:{f}" for f in FACTS_CARD]
     return rec, card + ["OWNERSHIP_NOT_VERIFIED:DRAFT"]
 
 
@@ -335,3 +333,70 @@ def test_file_level_codes(journal, cfg):
     _load(journal, cfg, wrap(record(), schema_version="news-research-v1.3"))
     (ev,) = journal.events("RESEARCH_FILE_REJECTED")
     assert json.loads(ev["payload"])["codes"] == ["VERSION_MISMATCH"]
+
+
+# ---- v1.6 null rules (Skeptic-signed 9558c999...) ----
+FIXTURE_V15 = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v15.json")
+
+
+@pytest.mark.parametrize("key", NULL_KEYS)
+def test_v16_known_value_with_null_source_field_is_invalid(key):
+    ok, errs, _ = v(record(next_earnings=dict(fact("2026-12-17"), **{key: None})))
+    assert not ok and f"SCHEMA_INVALID:next_earnings.{key}" in errs, errs
+
+
+@pytest.mark.parametrize("key", NULL_KEYS)
+def test_v16_null_value_with_null_source_field_is_invalid(key):
+    # null is not "UNKNOWN": the source fields may only be null when value is exactly "UNKNOWN"
+    ok, errs, _ = v(record(next_earnings=dict(fact(None), **{key: None})))
+    assert not ok and f"SCHEMA_INVALID:next_earnings.{key}" in errs, errs
+
+
+def test_v16_unknown_value_allows_null_source_fields_but_still_fails_gate():
+    f = dict(fact("UNKNOWN"), **{k: None for k in NULL_KEYS})
+    ok, errs, _ = v(record(next_earnings=f))
+    assert not ok and errs == ["FACT_UNKNOWN:next_earnings"], errs
+
+
+def test_v16_unknown_value_never_allows_null_retrieved_at():
+    f = dict(fact("UNKNOWN"), retrieved_at_utc=None)
+    ok, errs, _ = v(record(next_earnings=f))
+    assert "SCHEMA_INVALID:next_earnings.retrieved_at_utc" in errs, errs
+
+
+def test_v16_null_rule_applies_to_wheel_card_and_risk_flag_facts():
+    ok, _, out = v(record(ocf_filing_date=dict(fact("2026-10-03"), source_url=None)))
+    assert ok and not out["wheel_ok"] and "SCHEMA_INVALID:ocf_filing_date.source_url" in out["wheel_reasons"]
+    ok, errs, _ = v(record(risk_flags=[dict(fact("dilution"), evidence_kind=None)]))
+    assert not ok and errs == ["SCHEMA_INVALID:risk_flags[0].evidence_kind"], errs
+    ok, errs, _ = v(record(risk_flags=[dict(fact("UNKNOWN"), evidence_kind=None)]))
+    assert ok, errs
+
+
+def test_v16_verified_by_null_with_verified_at_set_is_invalid():
+    ok, errs, _ = v(record(verified_by=None))                  # verified_at_utc is set in record()
+    assert not ok and "SCHEMA_INVALID:verified_by" in errs, errs
+
+
+def test_v16_verified_by_null_allowed_while_verified_at_null():
+    ok, errs, _ = v(record(verification_status="PENDING", verified_by=None, verified_at_utc=None))
+    assert not ok and errs == ["NOT_VERIFIED:PENDING"], errs
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("VERIFIED", ["VERIFIED_AT_MISSING", "SCHEMA_INVALID:verified_by"]),
+    ("INVALID", ["NOT_VERIFIED:INVALID", "SCHEMA_INVALID:verified_by"]),
+])
+def test_v16_verified_by_required_for_verified_or_invalid(status, expected):
+    ok, errs, _ = v(record(verification_status=status, verified_by=None, verified_at_utc=None))
+    assert not ok and sorted(errs) == sorted(expected), errs
+
+
+def test_v16_verified_by_must_still_be_skeptic():
+    assert v(record(verified_by="News"))[1] == ["VERIFIER_NOT_SKEPTIC"]
+    assert v(record(verified_by=7))[1] == ["SCHEMA_INVALID:verified_by"]
+
+
+def test_v15_bridge_file_now_rejected_as_version_mismatch(cfg):
+    rep = R.check_text(open(FIXTURE_V15).read(), cfg, datetime(2026, 11, 11, 17, 40, tzinfo=timezone.utc))
+    assert rep["file_status"] == "REJECTED" and rep["file_codes"] == ["VERSION_MISMATCH"]

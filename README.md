@@ -107,17 +107,17 @@ There is no live mode.
 
 The feed is optional. Point `GITHUB_RESEARCH_REPO` at `<owner>/<research-repo>` (exactly `owner/name`). The runner lists `research/*.json` through the GitHub contents API with the read-only token, follows `ETag` / `If-None-Match`, and polls at most every 15 minutes. Paths outside that folder, non-JSON names, and files over 1 MB are skipped. File bodies are parsed as JSON data and are never executed or imported.
 
-The contract is News schema v1.5, `schemas/news_schema_v1.5.json`. Its sha256 must equal `policy.research.signed_schema_sha256`:
+The contract is News schema v1.6, `schemas/news_schema_v1.6.json`. Its sha256 must equal `policy.research.signed_schema_sha256`:
 
-`08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30`
+`9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99`
 
-The file's `schema_version` must be `news-research-v1.5`. A missing signature, a hash mismatch, or a different version blocks every new entry (`SCHEMA_NOT_SIGNED`, `SCHEMA_HASH_MISMATCH`, `SCHEMA_VERSION_MISMATCH`). `schemas/news_schema_v1.2.json` and `schemas/news_schema_v1.3.json` are kept for history and are not accepted.
+The file's `schema_version` must be `news-research-v1.6`. A missing signature, a hash mismatch, or a different version blocks every new entry (`SCHEMA_NOT_SIGNED`, `SCHEMA_HASH_MISMATCH`, `SCHEMA_VERSION_MISMATCH`). `schemas/news_schema_v1.2.json`, `schemas/news_schema_v1.3.json` and `schemas/news_schema_v1.5.json` are kept for history and are not accepted. v1.6 changes only the null rules: a fact's source fields may be null only when its value is `UNKNOWN`, and `verified_by` may be null only while `verified_at_utc` is null.
 
 A research file is a wrapper:
 
 ```json
 {
-  "schema_version": "news-research-v1.5",
+  "schema_version": "news-research-v1.6",
   "published_at_utc": "2026-01-01T00:00:00Z",
   "publisher": "News",
   "records": []
@@ -155,7 +155,7 @@ run-paper.sh             cron entry, one AUTO_PAPER cycle
 requirements.txt         Pinned Python packages
 pytest.ini               Pytest paths; cache provider disabled
 sakibdesk/               Runner package (broker client, books, journal, research, risk)
-schemas/                 Pinned news schema v1.5, plus v1.2 and v1.3 for history
+schemas/                 Pinned news schema v1.6, plus v1.2, v1.3 and v1.5 for history
 tests/                   Offline pytest suite and fixtures
 .github/workflows/tests.yml
 ```

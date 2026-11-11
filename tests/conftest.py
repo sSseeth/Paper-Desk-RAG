@@ -33,7 +33,7 @@ def make_root(tmp_path, signed=True, **policy_over):
         shutil.copy(os.path.join(ROOT, f), tmp_path / f)
     shutil.copytree(os.path.join(ROOT, "schemas"), tmp_path / "schemas")
     p = json.load(open(tmp_path / "policy.json"))
-    # signed=False simulates an unsigned schema (shipped policy now pins signed v1.5)
+    # signed=False simulates an unsigned schema (shipped policy now pins signed v1.6)
     p["research"]["signed_schema_sha256"] = (sha256_file(str(tmp_path / p["research"]["schema_file"]))
                                              if signed else "")
     for k, v in policy_over.items():
