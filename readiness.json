@@ -1,26 +1,31 @@
 {
   "generated": "2026-11-12 (Australia/Sydney)",
-  "note": "Statuses: implemented / tested-offline / not-connected / blocked. Mock tests prove code paths only.",
+  "note": "Statuses: passed / implemented / tested-offline / not-connected / blocked. 'passed' means observed against the Alpaca paper account; mock tests prove code paths only. No account numbers, IDs or keys are recorded here.",
   "checks": [
     {
       "check": "Paper boundary",
-      "status": "tested-offline",
-      "reason": "Hard-coded paper host, http/redirect/host-mismatch refusal, redaction and account-ID mismatch block tested with mocks. Real expected account ID not yet confirmed: blocked on Alpaca paper keys."
+      "status": "passed",
+      "reason": "doctor confirmed the hard-coded paper host (https://paper-api.alpaca.markets) and that the paper account matches the expected account on 2026-11-12. http/redirect/host-mismatch refusal and redaction remain mock-tested. Account numbers and IDs are deliberately not recorded in this public repo."
     },
     {
       "check": "Read-only connection",
-      "status": "blocked",
-      "reason": "Account/positions/orders/clock/calendar/contracts/feeds clients implemented with pagination and 429 handling, but never called: no Alpaca paper keys (offline-only instruction)."
+      "status": "passed",
+      "reason": "doctor (secrets, account, clock, IEX stock feed) and snapshot ran read-only against Alpaca paper on 2026-11-12 (Windows PowerShell, Python 3.13). Nothing was ordered or cancelled."
+    },
+    {
+      "check": "Capital check",
+      "status": "passed",
+      "reason": "Snapshot 2026-11-12 clean: $100,000 cash and equity, ledgers $20,000 STOCK / $80,000 WHEEL, no positions, open orders, reservations, option positions or assigned lots; ledger-vs-broker cash difference $0.00. Sizer's capital check passed. This clears capital only; Sizer needs a fresh snapshot before every sizing pass."
     },
     {
       "check": "Research schema",
       "status": "tested-offline",
-      "reason": "Skeptic-signed News schema v1.5 is pinned: schemas/news_schema_v1.5.json, policy.research.signed_schema_sha256 = 08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30 (also verifies the file says news-research-v1.5). Validator implements the v1.5 wrapper, per-record schema_version, card_created_at_utc 72h clock, ocf_filing_date and both Wheel statuses; offline tests only. v1.2/v1.3 kept for history. Every block carries a specific reason code; News's bridge test file (copied as a test fixture) is blocked offline with TEST_FILE, NOT_VERIFIED:PENDING, OWNERSHIP_NOT_VERIFIED:DRAFT, FACT_UNKNOWN and SCHEMA_INVALID (null source_type/evidence_kind) codes."
+      "reason": "Skeptic-signed News schema v1.6 is pinned: schemas/news_schema_v1.6.json, policy.research.signed_schema_sha256 = 9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99 (file must also say news-research-v1.6). v1.6 changes only the null rules: a fact's source fields may be null only when its value is UNKNOWN, and verified_by may be null only while verified_at_utc is null. The validator enforces both, with offline positive and negative tests. v1.5, v1.3 and v1.2 kept for history and not accepted."
     },
     {
       "check": "Research bridge",
       "status": "blocked",
-      "reason": "Validation, ETag/304, 15-min interval, research/*.json-only, no execution tested offline against v1.5. Not connected: News has no access to <owner>/<research-repo> yet, no test file has been published, and the runner's read-only GitHub token has never been used against the repo. Until valid VERIFIED records arrive, no symbol has usable research, so new entries stay blocked. New read-only `desk.py research-check` exists but has never been run against GitHub."
+      "reason": "News publishes research to the private research repo. The read-only `desk.py research-check` has not yet been run against v1.6 records, so no symbol has usable VERIFIED research and new entries stay blocked."
     },
     {
       "check": "Order safety",
@@ -30,12 +35,12 @@
     {
       "check": "Stock lifecycle",
       "status": "blocked",
-      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits implemented and mock-tested; requires a separate mechanics paper account + keys."
+      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits implemented and mock-tested. Guide page 20 lifecycle checks on a separate mechanics paper account have not been run."
     },
     {
       "check": "Wheel lifecycle",
       "status": "blocked",
-      "reason": "State machine, screen, collateral, buyback and covered calls mock-tested; broker sell/buyback/expiry tests need paper keys and days/weeks of real expiries. Label PROVISIONAL."
+      "reason": "State machine, screen, collateral, buyback and covered calls mock-tested. Guide page 20 lifecycle checks on a separate mechanics paper account have not been run, and real expiries take days to weeks. Label PROVISIONAL."
     },
     {
       "check": "Assignment limits",
@@ -50,12 +55,17 @@
     {
       "check": "Accounting",
       "status": "tested-offline",
-      "reason": "Premium as cash+liability, adverse move loss, SPY $100k/$20k/$80k benchmarks, $1 cost overlay, drawdown tested with synthetic numbers; not reconciled against a real paper account."
+      "reason": "Premium as cash+liability, adverse move loss, SPY $100k/$20k/$80k benchmarks, $1 cost overlay and drawdown tested with synthetic numbers. The opening ledgers matched broker cash in the 2026-11-12 snapshot; no trades have been reconciled yet."
     },
     {
       "check": "Windows install",
-      "status": "not-connected",
-      "reason": "Commands documented; built and run only on Linux box (Python 3.13.5)."
+      "status": "passed",
+      "reason": "Installed on Windows from the public repo with Python 3.13; self-test and doctor passed on 2026-11-12. CI runs the suite on Python 3.11 and 3.13."
+    },
+    {
+      "check": "AUTO_PAPER",
+      "status": "blocked",
+      "reason": "Off. The desk is used manually. AUTO_PAPER stays off until research-check passes on v1.6 and the page 20 stock and Wheel lifecycle checks pass."
     }
   ]
 }

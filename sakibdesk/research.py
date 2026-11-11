@@ -2,19 +2,23 @@
 with a read-only token and conditional requests (ETag / If-None-Match), polled at most every 15 minutes.
 Files are parsed as JSON data only; nothing fetched is ever executed or imported.
 
-Runner research contract = News schema v1.5 (schemas/news_schema_v1.5.json, Skeptic-signed sha256
-08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30).
+Runner research contract = News schema v1.6 (schemas/news_schema_v1.6.json, Skeptic-signed sha256
+9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99).
 The schema file hash must equal policy.research.signed_schema_sha256 (Skeptic sign-off); if it is empty or
 different, ALL new entries are blocked with reason SCHEMA_NOT_SIGNED / SCHEMA_HASH_MISMATCH.
 
-v1.5 usable_rule (quoted from the schema): "Runner may use a record for new exposure only when
+v1.6 usable_rule (quoted from the schema; unchanged from v1.5): "Runner may use a record for new exposure only when
 verification_status == VERIFIED, verified_at_utc >= checked_at_utc, and now < valid_until_utc. For Wheel cards,
 additionally ownership_card_status == VERIFIED and now < card_valid_until_utc. An evidence_kind RUMOUR fact can
 never satisfy an eligibility fact; it may only add a risk flag. Any UNKNOWN eligibility fact fails the gate."
 
-v1.5 file format: {"schema_version", "published_at_utc", "publisher": "News", "records": [...]}; every record
+v1.6 file format: {"schema_version", "published_at_utc", "publisher": "News", "records": [...]}; every record
 carries its own schema_version, which must equal the file's and the pinned version. Anything else is rejected.
 Fields not in the schema are never invented: absent/UNKNOWN eligibility facts fail the gate.
+
+v1.6 null rules (the only change from v1.5): a common_fact's source_url, source_type, evidence_kind and
+published_or_as_of_utc may be null only when its value is "UNKNOWN"; verified_by may be null only while
+verified_at_utc is null (otherwise it must be "Skeptic", and it is required for VERIFIED or INVALID).
 """
 import base64, json, os, time
 from datetime import datetime, timedelta, timezone
@@ -23,12 +27,13 @@ from .config import sha256_file
 from .journal import iso
 
 GITHUB_API = "https://api.github.com"
-PINNED_SCHEMA_VERSION = "news-research-v1.5"   # must equal schema_version inside the pinned schema file
+PINNED_SCHEMA_VERSION = "news-research-v1.6"   # must equal schema_version inside the pinned schema file
 PUBLISHER = "News"
 CARD_MAX_HOURS = 72                             # guide p8; v1.5: card_valid_until_utc <= card_created_at_utc + 72h
 FACT_REQ = ("value", "source_url", "source_type", "confidence", "evidence_kind", "published_or_as_of_utc",
             "retrieved_at_utc")
 SOURCE_TYPES = {"SEC_FILING", "COMPANY_IR", "EVENT_FEED", "MARKET_DATA"}
+NULLABLE_IF_UNKNOWN = ("source_url", "source_type", "evidence_kind", "published_or_as_of_utc")   # v1.6 null rule
 REC_REQ = ("schema_version", "symbol", "exchange", "currency", "universe", "next_earnings", "latest_release_date",
            "risk_flags", "verification_status", "verification_reasons", "verified_by", "checked_at_utc",
            "valid_until_utc", "dividend", "verified_at_utc")
@@ -64,7 +69,7 @@ def schema_status(root, policy):
 
 # ---------------- reason codes (one specific code per block; journalled and reported) ----------------
 # SCHEMA_INVALID:<field>        field missing, wrong type, null where the schema gives no null, bad enum, non-UTC time
-# VERSION_MISMATCH              file or record schema_version != pinned news-research-v1.5
+# VERSION_MISMATCH              file or record schema_version != pinned news-research-v1.6
 # TEST_FILE                     file (or record) carries "test": true; never usable for exposure
 # SYMBOL_NOT_ALLOWED            symbol not in the 19-name US universe
 # NOT_VERIFIED:<status>         verification_status != VERIFIED (PENDING / INVALID / UNKNOWN / ...)
@@ -101,9 +106,9 @@ def _ts(rec, field, errs, prefix=""):
 
 
 def _fact(f, name, errs, eligibility=False):
-    """Validate a common_fact. v1.5 types source_type and evidence_kind as enums and source_url /
-    published_or_as_of_utc as strings with no null option (unlike verified_at_utc, which the schema marks
-    "ISO-8601 | null"), so null there is SCHEMA_INVALID:<name>.<key> even when value is UNKNOWN.
+    """Validate a common_fact. v1.6 null rule: source_url, source_type, evidence_kind and
+    published_or_as_of_utc may be null only when the fact's value is exactly "UNKNOWN". A known value (or a
+    null value) with any null source field is SCHEMA_INVALID:<name>.<key>. retrieved_at_utc is never null.
     Returns the value, or "UNKNOWN" for an UNKNOWN/null value (FACT_UNKNOWN is added by the caller's gate)."""
     if f is None or f == "UNKNOWN":
         if f is None:
@@ -114,16 +119,19 @@ def _fact(f, name, errs, eligibility=False):
     for k in FACT_REQ:
         if k not in f:
             _add(errs, f"SCHEMA_INVALID:{name}.{k}")
-    if "source_type" in f and f.get("source_type") not in SOURCE_TYPES:
+    # v1.6: these keys are skipped (allowed) only when they are null AND value == "UNKNOWN"
+    null_ok = {k for k in NULLABLE_IF_UNKNOWN if f.get("value") == "UNKNOWN" and k in f and f[k] is None}
+    if "source_type" in f and "source_type" not in null_ok and f.get("source_type") not in SOURCE_TYPES:
         _add(errs, f"SCHEMA_INVALID:{name}.source_type")
-    if "evidence_kind" in f and f.get("evidence_kind") not in EVIDENCE_KINDS:
+    if "evidence_kind" in f and "evidence_kind" not in null_ok and f.get("evidence_kind") not in EVIDENCE_KINDS:
         _add(errs, f"SCHEMA_INVALID:{name}.evidence_kind")
     if "confidence" in f and f.get("confidence") not in CONFIDENCE:
         _add(errs, f"SCHEMA_INVALID:{name}.confidence")
-    if "source_url" in f and not (isinstance(f.get("source_url"), str) and f["source_url"].startswith("https://")):
+    if "source_url" in f and "source_url" not in null_ok and not (
+            isinstance(f.get("source_url"), str) and f["source_url"].startswith("https://")):
         _add(errs, f"SCHEMA_INVALID:{name}.source_url")
     for k in ("published_or_as_of_utc", "retrieved_at_utc"):
-        if k in f:
+        if k in f and k not in null_ok:
             _ts(f, k, errs, f"{name}.")
     if eligibility and f.get("evidence_kind") == "RUMOUR":
         _add(errs, f"RUMOUR_NOT_ELIGIBLE:{name}")
@@ -182,9 +190,14 @@ def validate_record(rec, allowed_symbols, wheel_universe, now, test_file=False):
     if vs != "VERIFIED":
         _add(errs, f"NOT_VERIFIED:{vs if isinstance(vs, str) else 'null'}")
     vb = rec.get("verified_by")
-    if "verified_by" in rec and vb != "Skeptic":
-        # schema types verified_by as the literal "Skeptic" (no null option, unlike verified_at_utc)
-        _add(errs, "SCHEMA_INVALID:verified_by" if not isinstance(vb, str) else "VERIFIER_NOT_SKEPTIC")
+    if "verified_by" in rec:
+        # v1.6: verified_by may be null only while verified_at_utc is null; otherwise it must be "Skeptic".
+        # The schema also requires it when verification_status is VERIFIED or INVALID.
+        if vb is None:
+            if rec.get("verified_at_utc") is not None or vs in ("VERIFIED", "INVALID"):
+                _add(errs, "SCHEMA_INVALID:verified_by")
+        elif vb != "Skeptic":
+            _add(errs, "SCHEMA_INVALID:verified_by" if not isinstance(vb, str) else "VERIFIER_NOT_SKEPTIC")
     if not isinstance(rec.get("verification_reasons", []), list):
         _add(errs, "SCHEMA_INVALID:verification_reasons")
     va_raw = rec.get("verified_at_utc")
@@ -317,7 +330,7 @@ class ResearchBridge:
 
 
 def validate_file(data):
-    """v1.5 file wrapper. Returns (records or None, file_codes). Only wrapper problems reject the whole file;
+    """v1.6 file wrapper (same shape as v1.5). Returns (records or None, file_codes). Only wrapper problems reject the whole file;
     anything inside a record (null/UNKNOWN facts, bad fields) blocks that record only."""
     if not isinstance(data, dict):
         return None, ["SCHEMA_INVALID:file"]
