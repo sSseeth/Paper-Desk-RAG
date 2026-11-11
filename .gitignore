@@ -1,0 +1,44 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode and test caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime output. The journal (including the outbox table) is SQLite under data/,
+# with WAL/SHM sidecars. The lock, redacted cycle log, and keyring-fallback
+# secrets file live there too. reports/ and logs/ are written by desk.py and
+# the scheduler launchers. state/ is reserved for local runtime state.
+data/
+reports/
+logs/
+state/
+*.db
+*.sqlite*
+*.log
+
+# Secrets. setup-secrets uses the OS keyring. Never commit a dotenv or the
+# keyring fallback file (also covered by data/).
+.env*
+data/secrets.local.json
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace

@@ -1,0 +1,43 @@
+{
+  "strategy_version": "SPD-v2-2026-10-22",
+  "guide_sha256": "cb5a46b42c79ed2781308721d436362637b319d2a31d5c659bda5df7a9ce94a0",
+  "experiment_id": "EXP-100K-001",
+  "feed_profile": "FREE_MECHANICS",
+  "capital": {"initial": 100000.0, "stock": 20000.0, "wheel": 80000.0},
+  "stock": {
+    "max_pct_per_company": 0.05, "max_open_or_pending_names": 3, "max_new_entries_per_session": 2,
+    "risk_pct_per_entry": 0.0025, "breakout_lookback": 20, "sma_fast": 50, "sma_slow": 200,
+    "min_valid_bars": 220, "atr_period": 14, "r_atr_mult": 2.0, "target_r_mult": 3.0,
+    "rank_lookback": 63, "entry_window_start_min": 30, "entry_window_end_min": 60,
+    "ask_band_pct": 0.03, "entry_cancel_after_sec": 300, "max_holding_sessions": 20,
+    "earnings_block_sessions_before": 2, "earnings_block_sessions_after": 2,
+    "quote_max_age_sec": 60, "max_spread_pct_of_mid": 0.005
+  },
+  "wheel": {
+    "universe": ["MU", "AME", "AMD", "TSM", "NVDA", "AVGO", "ANET", "VRT"],
+    "max_active_cycles": 2, "max_pct_per_name": 0.20, "max_pct_combined": 0.40,
+    "put_reserve_cost_allowance_per_contract": 3.00,
+    "put_ceiling_mid_pct": 0.95, "dte_min": 30, "dte_max": 45, "dte_target": 35,
+    "put_delta_min": -0.30, "put_delta_max": -0.15, "call_delta_min": 0.15, "call_delta_max": 0.30,
+    "delta_target_abs": 0.20, "max_spread_pct_of_mid": 0.10, "min_open_interest": 500,
+    "oi_max_age_sessions": 2, "quote_max_age_sec": 60, "earnings_wait_sessions_after": 2,
+    "card_max_age_hours": 72, "take_profit_ask_pct_of_open": 0.50,
+    "warn_drawdown_pct": 0.10, "unwind_drawdown_pct": 0.20, "put_unwind_pct_below_strike": 0.20,
+    "entry_start_min_after_open": 60, "entry_stop_min_before_close": 60,
+    "notify_dte": [7, 1], "refresh_dte": [14, 7, 1], "entry_cancel_after_sec": 300
+  },
+  "orders": {"exit_reprice_interval_sec": 60, "exit_max_attempts": 3, "exit_reprice_band_pct": 0.01,
+             "healthy_reconciliations_to_resume": 3},
+  "risk": {"daily_loss_pct": 0.02, "experiment_drawdown_pct": 0.10},
+  "costs": {"overlay_per_option_contract_per_side": 1.0, "overlay_per_stock_transaction": 1.0},
+  "research": {"poll_min_interval_sec": 900, "signed_schema_sha256": "08cf202d4a719f505711e8902e5bf747bfa6c1f9b3cd80e835db2dc798b0cc30", "schema_file": "schemas/news_schema_v1.5.json",
+               "repo_path_prefix": "research/"},
+  "data_settings": {
+    "FREE_MECHANICS": {"stock_feed": "iex", "option_feed": "indicative", "option_quotes_label": "INDICATIVE (modified/delayed; not OPRA)"},
+    "EVALUATION": {"stock_feed": "sip", "option_feed": "opra", "option_quotes_label": "OPRA"},
+    "bar_timeframe": "1Day", "bar_session": "regular-hours daily bars as published by Alpaca (no extended-hours bars requested)",
+    "bar_adjustment": "split", "completed_bars_only": true,
+    "spy_filter_uses_same_feed_session_adjustment": true, "atr_smoothing": "wilder",
+    "calendar_source": "Alpaca /v2/clock and /v2/calendar; America/New_York named zone, no fixed offsets"
+  }
+}

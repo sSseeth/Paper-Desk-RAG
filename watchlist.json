@@ -1,0 +1,280 @@
+{
+ "source": "guide_v2 page 3",
+ "names": [
+  {
+   "symbol": "AAOI",
+   "company": "Applied Optoelectronics",
+   "theme": "Optical connectivity",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": true
+  },
+  {
+   "symbol": "NBIS",
+   "company": "Nebius",
+   "theme": "AI cloud",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": true
+  },
+  {
+   "symbol": "MU",
+   "company": "Micron",
+   "theme": "Memory / HBM",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": true
+  },
+  {
+   "symbol": "ALAB",
+   "company": "Astera Labs",
+   "theme": "AI interconnects",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "CRDO",
+   "company": "Credo Technology",
+   "theme": "High-speed connectivity",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "LITE",
+   "company": "Lumentum",
+   "theme": "Photonics",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "COHR",
+   "company": "Coherent",
+   "theme": "Optical components",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "ANET",
+   "company": "Arista Networks",
+   "theme": "Data-centre networking",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "MRVL",
+   "company": "Marvell Technology",
+   "theme": "Custom chips / infrastructure",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "AMD",
+   "company": "Advanced Micro Devices",
+   "theme": "Processors / AI compute",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "NVDA",
+   "company": "NVIDIA",
+   "theme": "AI compute",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "AVGO",
+   "company": "Broadcom",
+   "theme": "Custom chips / networking",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "TSM",
+   "company": "Taiwan Semiconductor (ADR)",
+   "theme": "Chip manufacturing",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "CRWV",
+   "company": "CoreWeave",
+   "theme": "GPU cloud",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "IREN",
+   "company": "IREN",
+   "theme": "AI cloud / data centres",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "APLD",
+   "company": "Applied Digital",
+   "theme": "Data-centre development",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "VRT",
+   "company": "Vertiv",
+   "theme": "Power / cooling",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "MP",
+   "company": "MP Materials",
+   "theme": "Rare earths / magnets",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": false,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "AME",
+   "company": "AMETEK",
+   "theme": "Motion control / instruments",
+   "market": "US",
+   "currency": "USD",
+   "stock_eligible": true,
+   "wheel_eligible": true,
+   "alerts_only": false,
+   "report_priority": false
+  },
+  {
+   "symbol": "6594",
+   "company": "Nidec",
+   "theme": "Motors / motion systems",
+   "market": "Tokyo",
+   "currency": "JPY",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  },
+  {
+   "symbol": "6324",
+   "company": "Harmonic Drive Systems",
+   "theme": "Precision gears / actuators",
+   "market": "Tokyo",
+   "currency": "JPY",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  },
+  {
+   "symbol": "6471",
+   "company": "NSK",
+   "theme": "Bearings / ball screws",
+   "market": "Tokyo",
+   "currency": "JPY",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  },
+  {
+   "symbol": "SHA0",
+   "company": "Schaeffler (incl. Ewellix)",
+   "theme": "Actuators",
+   "market": "Germany",
+   "currency": "EUR",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  },
+  {
+   "symbol": "02050",
+   "company": "Sanhua Intelligent Controls",
+   "theme": "Controls / actuator research",
+   "market": "Hong Kong",
+   "currency": "HKD",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  },
+  {
+   "symbol": "LYC",
+   "company": "Lynas Rare Earths",
+   "theme": "Rare-earth production",
+   "market": "Australia",
+   "currency": "AUD",
+   "stock_eligible": false,
+   "wheel_eligible": false,
+   "alerts_only": true,
+   "report_priority": false
+  }
+ ]
+}

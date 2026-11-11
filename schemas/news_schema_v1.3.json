@@ -1,0 +1,61 @@
+{
+  "schema_version": "news-research-v1.3",
+  "common_fact": {
+    "value": "any | \"UNKNOWN\"",
+    "source_url": "string",
+    "source_type": "SEC_FILING | COMPANY_IR | EVENT_FEED | MARKET_DATA",
+    "confidence": "HIGH | MEDIUM | LOW",
+    "evidence_kind": "FILING | ANNOUNCEMENT | RUMOUR",
+    "notes": "string",
+    "published_or_as_of_utc": "ISO-8601 UTC (Z)",
+    "retrieved_at_utc": "ISO-8601 UTC (Z)"
+  },
+  "research_record": {
+    "exchange": "string",
+    "currency": "string",
+    "universe": "US_STOCK | WHEEL | ALERT_ONLY",
+    "next_earnings": "common_fact (exact date, or {earliest, latest} range, or UNKNOWN)",
+    "latest_release_date": "common_fact",
+    "risk_flags": "[common_fact]",
+    "verification_status": "PENDING | VERIFIED | INVALID | UNKNOWN (auto-reverts to PENDING whenever checked_at_utc > verified_at_utc)",
+    "verification_reasons": "[string]",
+    "verified_by": "Skeptic",
+    "symbol": "string",
+    "checked_at_utc": "ISO-8601 UTC (Z); replaces record_updated_at",
+    "valid_until_utc": "ISO-8601 UTC; next pre-US-session refresh, max 24h after checked_at_utc, cut to now on material news",
+    "dividend": "common_fact {amount, ex_date, payment_date} | VERIFIED_NONE | UNKNOWN",
+    "verified_at_utc": "ISO-8601 | null"
+  },
+  "wheel_card": {
+    "extends": "research_record",
+    "latest_annual_operating_cash_flow": "common_fact (amount, currency, fiscal_year_end, filing_date); must be > 0 for eligibility",
+    "thesis_evidence": "[common_fact] (production vs prototype marked in notes)",
+    "eligibility_facts_only": true,
+    "paper_universe_eligible": "common_fact (true | false | UNKNOWN), matched against the guide's Wheel universe list",
+    "wheel_universe": "MU, AME, AMD, TSM, NVDA, AVGO, ANET, VRT only (guide p8)",
+    "going_concern_flag": "common_fact TRUE | FALSE | UNKNOWN",
+    "bankruptcy_flag": "common_fact TRUE | FALSE | UNKNOWN",
+    "ownership_card_status": "DRAFT | SENT_TO_SKEPTIC | VERIFIED | INVALID | EXPIRED",
+    "card_valid_until_utc": "ISO-8601 UTC; at most 72h after card creation (guide p8); event facts still refresh each US day"
+  },
+  "usable_rule": "Runner may use a record for new exposure only when verification_status == VERIFIED, verified_at_utc >= checked_at_utc, now < valid_until_utc (and for Wheel cards now < card_valid_until_utc). An evidence_kind RUMOUR fact can never satisfy an eligibility fact; it may only add a risk flag. Any UNKNOWN eligibility fact fails the gate.",
+  "scout_alert": {
+    "ticker": "string",
+    "exchange": "string",
+    "currency": "string",
+    "local_session": "string",
+    "trigger": "PRICE_3PCT_HOUR | VOLUME_2X_WINDOW | NEWS",
+    "bar_start": "ISO-8601 with offset",
+    "bar_end": "ISO-8601 with offset",
+    "measured_value": "number | UNKNOWN",
+    "baseline": "number | UNKNOWN",
+    "group_id": "string",
+    "position_risk": "boolean",
+    "daily_alert_count": "integer",
+    "source": "common_fact",
+    "informational_only": true,
+    "note": "An alert is never a trade signal on its own; News may cut a record's valid_until to now from it."
+  },
+  "guide_ref": "guide_v2.pdf sha256 cb5a46b42c79ed2781308721d436362637b319d2a31d5c659bda5df7a9ce94a0, pages 8 and 18",
+  "boolean_rule": "FALSE and UNKNOWN are distinct values; UNKNOWN fails every gate."
+}

@@ -1,0 +1,109 @@
+{
+  "schema_version": "news-research-v1.5",
+  "published_at_utc": "2026-11-11T17:35:21Z",
+  "publisher": "News",
+  "test": true,
+  "records": [
+    {
+      "schema_version": "news-research-v1.5",
+      "symbol": "MU",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "universe": "WHEEL",
+      "checked_at_utc": "2026-11-11T17:35:21Z",
+      "valid_until_utc": "2026-11-11T18:35:21Z",
+      "next_earnings": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "latest_release_date": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "dividend": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "risk_flags": [],
+      "verification_status": "PENDING",
+      "verification_reasons": [
+        "BRIDGE TEST: must be blocked by runner"
+      ],
+      "verified_by": null,
+      "verified_at_utc": null,
+      "latest_annual_operating_cash_flow": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "ocf_filing_date": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "thesis_evidence": [],
+      "going_concern_flag": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "bankruptcy_flag": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "paper_universe_eligible": {
+        "value": "UNKNOWN",
+        "source_url": null,
+        "source_type": null,
+        "published_or_as_of_utc": null,
+        "retrieved_at_utc": "2026-11-11T17:35:21Z",
+        "confidence": "LOW",
+        "evidence_kind": null,
+        "notes": "bridge test placeholder; not researched"
+      },
+      "ownership_card_status": "DRAFT",
+      "card_created_at_utc": "2026-11-11T17:35:21Z",
+      "card_valid_until_utc": "2026-11-11T18:35:21Z",
+      "eligibility_facts_only": true
+    }
+  ]
+}
