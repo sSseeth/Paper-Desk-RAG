@@ -208,7 +208,8 @@ def management_actions(cycle, *, now_session_date, calendar, stock_mid, opt_bid,
     if distress:
         acts.append(("BUY_TO_CLOSE" if short else ("SELL_SHARES" if st == "SHARES_HELD" else "FLAG"),
                      "verified going-concern/bankruptcy flag"))
-    if st == "CALL_OPEN" and dividend not in (None, "UNKNOWN") and closing_session_preceding_exdiv \
+    # NOT_YET_DECLARED has no ex_date. Treat it like UNKNOWN: do not buy the call back for a dividend.
+    if st == "CALL_OPEN" and dividend not in (None, "UNKNOWN", "NOT_YET_DECLARED") and closing_session_preceding_exdiv \
             and opt_bid is not None and opt_ask is not None and stock_mid is not None:
         intrinsic = max(0.0, stock_mid - d["strike"])
         extrinsic = max(0.0, (opt_bid + opt_ask) / 2 - intrinsic)

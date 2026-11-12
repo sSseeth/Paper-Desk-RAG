@@ -58,7 +58,7 @@ On Linux or macOS the same steps use `python3.11 -m venv .venv` and `./.venv/bin
 
 Troubleshooting: without `.\.venv\Scripts\Activate.ps1` in that PowerShell session, `keyring` is not importable and `doctor` reports every secret as missing even though Credential Manager has them.
 
-A hash mismatch in `doctor` after cloning on Windows (`core.autocrlf=true` turning `schemas/news_schema_v1.6.json`, `policy.json`, and `watchlist.json` into CRLF) is fixed by `git config core.autocrlf false; git rm --cached -r -q .; git reset --hard`. `.gitattributes` now prevents that conversion on fresh clones.
+A hash mismatch in `doctor` after cloning on Windows (`core.autocrlf=true` turning `schemas/news_schema_v1.7.json`, `policy.json`, and `watchlist.json` into CRLF) is fixed by `git config core.autocrlf false; git rm --cached -r -q .; git reset --hard`. `.gitattributes` now prevents that conversion on fresh clones.
 
 ## Secrets
 
@@ -112,17 +112,17 @@ There is no live mode.
 
 The feed is optional. Point `GITHUB_RESEARCH_REPO` at `<owner>/<research-repo>` (exactly `owner/name`). The runner lists `research/*.json` through the GitHub contents API with the read-only token, follows `ETag` / `If-None-Match`, and polls at most every 15 minutes. Paths outside that folder, non-JSON names, and files over 1 MB are skipped. File bodies are parsed as JSON data and are never executed or imported.
 
-The contract is News schema v1.6, `schemas/news_schema_v1.6.json`. Its sha256 must equal `policy.research.signed_schema_sha256`:
+The contract is News schema v1.7, `schemas/news_schema_v1.7.json`. Its sha256 must equal `policy.research.signed_schema_sha256`:
 
-`9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99`
+`a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0`
 
-The file's `schema_version` must be `news-research-v1.6`. A missing signature, a hash mismatch, or a different version blocks every new entry (`SCHEMA_NOT_SIGNED`, `SCHEMA_HASH_MISMATCH`, `SCHEMA_VERSION_MISMATCH`). `schemas/news_schema_v1.2.json`, `schemas/news_schema_v1.3.json` and `schemas/news_schema_v1.5.json` are kept for history and are not accepted. v1.6 changes only the null rules: a fact's source fields may be null only when its value is `UNKNOWN`, and `verified_by` may be null only while `verified_at_utc` is null.
+The file's `schema_version` must be `news-research-v1.7`. A missing signature, a hash mismatch, or a different version blocks every new entry (`SCHEMA_NOT_SIGNED`, `SCHEMA_HASH_MISMATCH`, `SCHEMA_VERSION_MISMATCH`). `schemas/news_schema_v1.2.json`, `schemas/news_schema_v1.3.json`, `schemas/news_schema_v1.5.json` and `schemas/news_schema_v1.6.json` are kept for history and are not accepted. The v1.6 null rules still hold: a fact's source fields may be null only when its value is `UNKNOWN`, and `verified_by` may be null only while `verified_at_utc` is null. v1.7 also requires `verified_by` to be `Skeptic` for a `VERIFIED`, `INVALID`, or `UNKNOWN` verdict. `source_type` `INTERNAL_GUIDE` and `evidence_kind` `INTERNAL_POLICY` may back only `paper_universe_eligible`, and every `source_url` must still be `https://`. A dividend is the next declared dividend (`amount`, `ex_date`, `payment_date`), `NOT_YET_DECLARED`, `VERIFIED_NONE`, or `UNKNOWN`. A past `ex_date` is rejected. `NOT_YET_DECLARED` blocks a new covered call on that symbol (`DIVIDEND_NOT_YET_DECLARED`) and is otherwise handled like an `UNKNOWN` dividend.
 
 A research file is a wrapper:
 
 ```json
 {
-  "schema_version": "news-research-v1.6",
+  "schema_version": "news-research-v1.7",
   "published_at_utc": "2026-01-01T00:00:00Z",
   "publisher": "News",
   "records": []
@@ -160,7 +160,7 @@ run-paper.sh             cron entry, one AUTO_PAPER cycle
 requirements.txt         Pinned Python packages
 pytest.ini               Pytest paths; cache provider disabled
 sakibdesk/               Runner package (broker client, books, journal, research, risk)
-schemas/                 Pinned news schema v1.6, plus v1.2, v1.3 and v1.5 for history
+schemas/                 Pinned news schema v1.7, plus v1.2, v1.3, v1.5 and v1.6 for history
 tests/                   Offline pytest suite and fixtures
 .github/workflows/tests.yml
 ```

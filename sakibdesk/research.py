@@ -2,38 +2,52 @@
 with a read-only token and conditional requests (ETag / If-None-Match), polled at most every 15 minutes.
 Files are parsed as JSON data only; nothing fetched is ever executed or imported.
 
-Runner research contract = News schema v1.6 (schemas/news_schema_v1.6.json, Skeptic-signed sha256
-9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99).
+Runner research contract = News schema v1.7 (schemas/news_schema_v1.7.json, Skeptic-signed sha256
+a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0).
 The schema file hash must equal policy.research.signed_schema_sha256 (Skeptic sign-off); if it is empty or
 different, ALL new entries are blocked with reason SCHEMA_NOT_SIGNED / SCHEMA_HASH_MISMATCH.
 
-v1.6 usable_rule (quoted from the schema; unchanged from v1.5): "Runner may use a record for new exposure only when
+v1.7 usable_rule (quoted from the schema; unchanged from v1.6): "Runner may use a record for new exposure only when
 verification_status == VERIFIED, verified_at_utc >= checked_at_utc, and now < valid_until_utc. For Wheel cards,
 additionally ownership_card_status == VERIFIED and now < card_valid_until_utc. An evidence_kind RUMOUR fact can
 never satisfy an eligibility fact; it may only add a risk flag. Any UNKNOWN eligibility fact fails the gate."
 
-v1.6 file format: {"schema_version", "published_at_utc", "publisher": "News", "records": [...]}; every record
+v1.7 file format: {"schema_version", "published_at_utc", "publisher": "News", "records": [...]}; every record
 carries its own schema_version, which must equal the file's and the pinned version. Anything else is rejected.
 Fields not in the schema are never invented: absent/UNKNOWN eligibility facts fail the gate.
 
-v1.6 null rules (the only change from v1.5): a common_fact's source_url, source_type, evidence_kind and
-published_or_as_of_utc may be null only when its value is "UNKNOWN"; verified_by may be null only while
-verified_at_utc is null (otherwise it must be "Skeptic", and it is required for VERIFIED or INVALID).
+v1.6 null rules, unchanged in v1.7: a common_fact's source_url, source_type, evidence_kind and
+published_or_as_of_utc may be null only when its value is "UNKNOWN". verified_by may be null only while
+verified_at_utc is null; otherwise it must be "Skeptic".
+
+v1.7 additions: source_type INTERNAL_GUIDE and evidence_kind INTERNAL_POLICY may back only
+paper_universe_eligible (internal_guide_rule). source_url must still be https:// for every source type,
+including INTERNAL_GUIDE; there is no file:// exception. verified_by is required for any Skeptic verdict
+(VERIFIED, INVALID, or UNKNOWN). dividend is a common_fact {amount, ex_date, payment_date} for the next
+declared dividend, or NOT_YET_DECLARED, VERIFIED_NONE, or UNKNOWN. A past ex_date is SCHEMA_INVALID.
+NOT_YET_DECLARED is unresolved dividend risk: it blocks a covered-call entry (DIVIDEND_NOT_YET_DECLARED)
+and is otherwise handled like UNKNOWN. Notes are never parsed for an expected declaration date.
 """
 import base64, json, os, time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import requests
 from .config import sha256_file
 from .journal import iso
 
 GITHUB_API = "https://api.github.com"
-PINNED_SCHEMA_VERSION = "news-research-v1.6"   # must equal schema_version inside the pinned schema file
+PINNED_SCHEMA_VERSION = "news-research-v1.7"   # must equal schema_version inside the pinned schema file
 PUBLISHER = "News"
 CARD_MAX_HOURS = 72                             # guide p8; v1.5: card_valid_until_utc <= card_created_at_utc + 72h
 FACT_REQ = ("value", "source_url", "source_type", "confidence", "evidence_kind", "published_or_as_of_utc",
             "retrieved_at_utc")
-SOURCE_TYPES = {"SEC_FILING", "COMPANY_IR", "EVENT_FEED", "MARKET_DATA"}
+SOURCE_TYPES = {"SEC_FILING", "COMPANY_IR", "EVENT_FEED", "MARKET_DATA", "INTERNAL_GUIDE"}
 NULLABLE_IF_UNKNOWN = ("source_url", "source_type", "evidence_kind", "published_or_as_of_utc")   # v1.6 null rule
+# v1.7: these source/evidence values may back paper_universe_eligible only.
+GUIDE_ONLY_SOURCE = "INTERNAL_GUIDE"
+GUIDE_ONLY_EVIDENCE = "INTERNAL_POLICY"
+GUIDE_ONLY_FACT = "paper_universe_eligible"
+DIVIDEND_DECLARED_KEYS = ("amount", "ex_date", "payment_date")
+SKEPTIC_VERDICTS = {"VERIFIED", "INVALID", "UNKNOWN"}   # v1.7: UNKNOWN joined VERIFIED and INVALID
 REC_REQ = ("schema_version", "symbol", "exchange", "currency", "universe", "next_earnings", "latest_release_date",
            "risk_flags", "verification_status", "verification_reasons", "verified_by", "checked_at_utc",
            "valid_until_utc", "dividend", "verified_at_utc")
@@ -69,7 +83,8 @@ def schema_status(root, policy):
 
 # ---------------- reason codes (one specific code per block; journalled and reported) ----------------
 # SCHEMA_INVALID:<field>        field missing, wrong type, null where the schema gives no null, bad enum, non-UTC time
-# VERSION_MISMATCH              file or record schema_version != pinned news-research-v1.6
+# VERSION_MISMATCH              file or record schema_version != pinned news-research-v1.7
+# DIVIDEND_NOT_YET_DECLARED     dividend is NOT_YET_DECLARED; blocks covered-call entry only
 # TEST_FILE                     file (or record) carries "test": true; never usable for exposure
 # SYMBOL_NOT_ALLOWED            symbol not in the 19-name US universe
 # NOT_VERIFIED:<status>         verification_status != VERIFIED (PENDING / INVALID / UNKNOWN / ...)
@@ -86,7 +101,7 @@ def schema_status(root, policy):
 # CARD_VALIDITY_OVER_72H, CARD_EXPIRED, CARD_OLDER_THAN_72H, CARD_CREATED_MOVED
 # Loader: DUPLICATE_SYMBOL, INVALID_JSON
 CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
-EVIDENCE_KINDS = {"FILING", "ANNOUNCEMENT", "RUMOUR"}
+EVIDENCE_KINDS = {"FILING", "ANNOUNCEMENT", "RUMOUR", "INTERNAL_POLICY"}
 UNIVERSES = {"US_STOCK", "WHEEL", "ALERT_ONLY"}
 VERIFICATION = {"PENDING", "VERIFIED", "INVALID", "UNKNOWN"}
 CARD_STATUS = {"DRAFT", "SENT_TO_SKEPTIC", "VERIFIED", "INVALID", "EXPIRED"}
@@ -106,9 +121,11 @@ def _ts(rec, field, errs, prefix=""):
 
 
 def _fact(f, name, errs, eligibility=False):
-    """Validate a common_fact. v1.6 null rule: source_url, source_type, evidence_kind and
+    """Validate a common_fact. v1.6 null rule (unchanged in v1.7): source_url, source_type, evidence_kind and
     published_or_as_of_utc may be null only when the fact's value is exactly "UNKNOWN". A known value (or a
     null value) with any null source field is SCHEMA_INVALID:<name>.<key>. retrieved_at_utc is never null.
+    v1.7: INTERNAL_GUIDE / INTERNAL_POLICY may back only paper_universe_eligible. source_url must be https://
+    for every source type, including INTERNAL_GUIDE (no file:// exception).
     Returns the value, or "UNKNOWN" for an UNKNOWN/null value (FACT_UNKNOWN is added by the caller's gate)."""
     if f is None or f == "UNKNOWN":
         if f is None:
@@ -125,8 +142,15 @@ def _fact(f, name, errs, eligibility=False):
         _add(errs, f"SCHEMA_INVALID:{name}.source_type")
     if "evidence_kind" in f and "evidence_kind" not in null_ok and f.get("evidence_kind") not in EVIDENCE_KINDS:
         _add(errs, f"SCHEMA_INVALID:{name}.evidence_kind")
+    # v1.7 internal_guide_rule: these values are SCHEMA_INVALID on any fact except paper_universe_eligible.
+    if name != GUIDE_ONLY_FACT:
+        if f.get("source_type") == GUIDE_ONLY_SOURCE:
+            _add(errs, f"SCHEMA_INVALID:{name}.source_type")
+        if f.get("evidence_kind") == GUIDE_ONLY_EVIDENCE:
+            _add(errs, f"SCHEMA_INVALID:{name}.evidence_kind")
     if "confidence" in f and f.get("confidence") not in CONFIDENCE:
         _add(errs, f"SCHEMA_INVALID:{name}.confidence")
+    # https:// for every source type. INTERNAL_GUIDE does not get a file:// exception.
     if "source_url" in f and "source_url" not in null_ok and not (
             isinstance(f.get("source_url"), str) and f["source_url"].startswith("https://")):
         _add(errs, f"SCHEMA_INVALID:{name}.source_url")
@@ -138,6 +162,59 @@ def _fact(f, name, errs, eligibility=False):
     if f.get("value") in ("UNKNOWN", None):
         return "UNKNOWN"
     return f.get("value")
+
+
+def _ex_date_is_past(ex, now):
+    """True when ex_date is before now, False when it is not, None when it cannot be read.
+
+    A YYYY-MM-DD date is past only when that calendar day is before now's UTC date, so today's
+    ex_date is still the next dividend. A UTC timestamp is past when the instant is strictly before now.
+    """
+    if not isinstance(ex, str) or not ex:
+        return None
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    if len(ex) == 10:
+        try:
+            return date.fromisoformat(ex) < now_utc.date()
+        except ValueError:
+            return None
+    try:
+        return parse_ts(ex) < now_utc
+    except (ValueError, TypeError):
+        return None
+
+
+def _dividend(rec, errs, notes, now):
+    """Resolve dividend. Returns the parsed value stored on the record.
+
+    Shape: common_fact {amount, ex_date, payment_date} for the next declared dividend, or the sentinels
+    NOT_YET_DECLARED, VERIFIED_NONE, and UNKNOWN. A past ex_date is SCHEMA_INVALID. NOT_YET_DECLARED does
+    not fail the record; it is unresolved risk, like UNKNOWN, and blocks covered calls only. The schema has
+    no expected-declaration date, so notes are not parsed.
+    """
+    if "dividend" not in rec:
+        notes.append("FACT_UNKNOWN:dividend (blocks covered calls only)")
+        return "UNKNOWN"
+    dv = rec.get("dividend")
+    if dv == "VERIFIED_NONE":
+        return None
+    if dv == "NOT_YET_DECLARED" or (isinstance(dv, dict) and dv.get("value") == "NOT_YET_DECLARED"):
+        if isinstance(dv, dict):
+            _fact(dv, "dividend", errs, True)
+        notes.append("DIVIDEND_NOT_YET_DECLARED (blocks covered calls only)")
+        return "NOT_YET_DECLARED"
+    v = _fact(dv, "dividend", errs, True)
+    if v in (None, "UNKNOWN"):
+        notes.append("FACT_UNKNOWN:dividend (blocks covered calls only)")
+        return "UNKNOWN"
+    if not isinstance(v, dict) or any(k not in v for k in DIVIDEND_DECLARED_KEYS):
+        _add(errs, "SCHEMA_INVALID:dividend")
+        return None
+    past = _ex_date_is_past(v.get("ex_date"), now)
+    if past is None or past:
+        _add(errs, "SCHEMA_INVALID:dividend.ex_date")
+        return None
+    return v
 
 
 def _gate_fact(rec, field, errs, label=None):
@@ -191,10 +268,10 @@ def validate_record(rec, allowed_symbols, wheel_universe, now, test_file=False):
         _add(errs, f"NOT_VERIFIED:{vs if isinstance(vs, str) else 'null'}")
     vb = rec.get("verified_by")
     if "verified_by" in rec:
-        # v1.6: verified_by may be null only while verified_at_utc is null; otherwise it must be "Skeptic".
-        # The schema also requires it when verification_status is VERIFIED or INVALID.
+        # Null only while verified_at_utc is null. v1.7 requires "Skeptic" for any Skeptic verdict
+        # (VERIFIED, INVALID, or UNKNOWN), not only VERIFIED and INVALID.
         if vb is None:
-            if rec.get("verified_at_utc") is not None or vs in ("VERIFIED", "INVALID"):
+            if rec.get("verified_at_utc") is not None or vs in SKEPTIC_VERDICTS:
                 _add(errs, "SCHEMA_INVALID:verified_by")
         elif vb != "Skeptic":
             _add(errs, "SCHEMA_INVALID:verified_by" if not isinstance(vb, str) else "VERIFIER_NOT_SKEPTIC")
@@ -214,17 +291,9 @@ def validate_record(rec, allowed_symbols, wheel_universe, now, test_file=False):
     elif ne is not None:
         out["earnings_earliest"] = out["earnings_latest"] = ne
     out["latest_release_date"] = _gate_fact(rec, "latest_release_date", errs) or "UNKNOWN"
-    # dividend: "common_fact | VERIFIED_NONE | UNKNOWN". UNKNOWN does not block the record (as before); it
-    # blocks covered calls (cycle.py) and is reported as an informational code.
+    # UNKNOWN and NOT_YET_DECLARED do not block the record; cycle.py blocks covered calls from them.
     out["notes"] = []
-    dv = rec.get("dividend")
-    if dv == "VERIFIED_NONE":
-        out["dividend"] = None
-    else:
-        v = _fact(dv, "dividend", errs, True) if "dividend" in rec else "UNKNOWN"
-        out["dividend"] = "UNKNOWN" if v in (None, "UNKNOWN") else v
-        if out["dividend"] == "UNKNOWN":
-            out["notes"].append("FACT_UNKNOWN:dividend (blocks covered calls only)")
+    out["dividend"] = _dividend(rec, errs, out["notes"], now)
     flags = rec.get("risk_flags")
     if "risk_flags" in rec and not isinstance(flags, list):
         _add(errs, "SCHEMA_INVALID:risk_flags"); flags = []
@@ -330,7 +399,7 @@ class ResearchBridge:
 
 
 def validate_file(data):
-    """v1.6 file wrapper (same shape as v1.5). Returns (records or None, file_codes). Only wrapper problems reject the whole file;
+    """v1.7 file wrapper (same shape as v1.6). Returns (records or None, file_codes). Only wrapper problems reject the whole file;
     anything inside a record (null/UNKNOWN facts, bad fields) blocks that record only."""
     if not isinstance(data, dict):
         return None, ["SCHEMA_INVALID:file"]

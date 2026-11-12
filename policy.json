@@ -30,7 +30,7 @@
              "healthy_reconciliations_to_resume": 3},
   "risk": {"daily_loss_pct": 0.02, "experiment_drawdown_pct": 0.10},
   "costs": {"overlay_per_option_contract_per_side": 1.0, "overlay_per_stock_transaction": 1.0},
-  "research": {"poll_min_interval_sec": 900, "signed_schema_sha256": "9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99", "schema_file": "schemas/news_schema_v1.6.json",
+  "research": {"poll_min_interval_sec": 900, "signed_schema_sha256": "a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0", "schema_file": "schemas/news_schema_v1.7.json",
                "repo_path_prefix": "research/"},
   "data_settings": {
     "FREE_MECHANICS": {"stock_feed": "iex", "option_feed": "indicative", "option_quotes_label": "INDICATIVE (modified/delayed; not OPRA)"},
