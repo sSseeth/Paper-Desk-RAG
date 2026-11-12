@@ -1,0 +1,4 @@
+# Hash-pinned files are checked byte for byte (schema sha256 and the config hash).
+# Disable line-ending conversion for every tracked file so checkout stays
+# byte-identical on any OS, whatever core.autocrlf is set to.
+* -text
