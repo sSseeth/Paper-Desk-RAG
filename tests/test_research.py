@@ -518,3 +518,69 @@ def test_v17_not_yet_declared_blocks_covered_call_and_unknown_still_does(cfg, jo
     C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
                     rows(_div("2026-11-17")), summary)
     assert [json.loads(e["payload"])["reason"] for e in journal.events("GATE_FAIL")] == reasons
+
+
+def test_v17_wrapped_verified_none_is_no_dividend():
+    # Publisher files wrap VERIFIED_NONE as a sourced common_fact. That is no dividend.
+    wrapped = dict(fact("VERIFIED_NONE"), confidence="MEDIUM",
+                   source_url="https://www.sec.gov/Archives/edgar/data/2488/",
+                   notes="no dividend declared")
+    ok, errs, out = v(record(dividend=wrapped))
+    assert ok and errs == [] and out["wheel_ok"] and out["dividend"] is None, errs
+    assert out["notes"] == []
+    # Bare VERIFIED_NONE is unchanged.
+    ok, errs, out = v(record(dividend="VERIFIED_NONE"))
+    assert ok and errs == [] and out["wheel_ok"] and out["dividend"] is None, errs
+    # Wrapped NOT_YET_DECLARED is unchanged: the record stays usable and still notes the covered-call block.
+    notes = "last paid 2026-09-15"
+    ok, errs, out = v(record(dividend=dict(fact("NOT_YET_DECLARED"), notes=notes)))
+    assert ok and errs == [] and out["wheel_ok"] and out["dividend"] == "NOT_YET_DECLARED", errs
+    assert out["notes"] == ["DIVIDEND_NOT_YET_DECLARED (blocks covered calls only)"]
+
+
+@pytest.mark.parametrize("url", [
+    "file:///filing.pdf",
+    "http://www.sec.gov/Archives/edgar/data/2488/",
+])
+def test_v17_wrapped_verified_none_rejects_non_https_source(url):
+    ok, errs, _ = v(record(dividend=dict(fact("VERIFIED_NONE"), source_url=url)))
+    assert not ok and errs == ["SCHEMA_INVALID:dividend.source_url"], errs
+
+
+def test_v17_wrapped_verified_none_missing_common_fact_fields_fails():
+    missing = fact("VERIFIED_NONE")
+    del missing["confidence"]
+    del missing["retrieved_at_utc"]
+    ok, errs, _ = v(record(dividend=missing))
+    assert not ok and errs == [
+        "SCHEMA_INVALID:dividend.confidence",
+        "SCHEMA_INVALID:dividend.retrieved_at_utc",
+    ], errs
+
+
+def test_v17_wrapped_verified_none_does_not_block_covered_call(cfg, journal, monkeypatch):
+    from sakibdesk.calendar_util import Session
+    from sakibdesk import cycle as C
+    sess = Session({"date": "2026-10-28", "open": "09:30", "close": "16:00"})
+    now = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+    journal.db.execute("INSERT INTO wheel_cycles VALUES(?,?,?,?,?,?)",
+                       ("C1", "MU", "SHARES_HELD", "{}", "", ""))
+    # Fill the active-cycle cap so the test stops after the covered-call gate.
+    journal.db.execute("INSERT INTO wheel_cycles VALUES(?,?,?,?,?,?)",
+                       ("C2", "AMD", "PUT_OPEN", "{}", "", ""))
+    allowed, wheel = set(cfg.us_symbols), set(cfg.wheel_symbols)
+    div = dict(fact("VERIFIED_NONE"), confidence="MEDIUM",
+               source_url="https://www.sec.gov/Archives/edgar/data/2488/")
+    ok, errs, out = R.validate_record(record(dividend=div), allowed, wheel, now)
+    assert ok and errs == [] and out["wheel_ok"] and out["dividend"] is None, errs
+    called = {}
+
+    def sell(*_a, **_k):
+        called["yes"] = True
+        return True
+
+    monkeypatch.setattr(C, "_sell_option", sell)
+    C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
+                    {"MU": (ok, errs, out)}, {})
+    assert called.get("yes") is True
+    assert journal.events("GATE_FAIL") == []

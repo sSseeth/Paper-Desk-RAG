@@ -24,9 +24,11 @@ v1.7 additions: source_type INTERNAL_GUIDE and evidence_kind INTERNAL_POLICY may
 paper_universe_eligible (internal_guide_rule). source_url must still be https:// for every source type,
 including INTERNAL_GUIDE; there is no file:// exception. verified_by is required for any Skeptic verdict
 (VERIFIED, INVALID, or UNKNOWN). dividend is a common_fact {amount, ex_date, payment_date} for the next
-declared dividend, or NOT_YET_DECLARED, VERIFIED_NONE, or UNKNOWN. A past ex_date is SCHEMA_INVALID.
-NOT_YET_DECLARED is unresolved dividend risk: it blocks a covered-call entry (DIVIDEND_NOT_YET_DECLARED)
-and is otherwise handled like UNKNOWN. Notes are never parsed for an expected declaration date.
+declared dividend, or NOT_YET_DECLARED, VERIFIED_NONE, or UNKNOWN. NOT_YET_DECLARED and VERIFIED_NONE may
+be a bare string or a sourced common_fact; a valid wrapped VERIFIED_NONE is no dividend. A past ex_date
+is SCHEMA_INVALID. NOT_YET_DECLARED is unresolved dividend risk: it blocks a covered-call entry
+(DIVIDEND_NOT_YET_DECLARED) and is otherwise handled like UNKNOWN. Notes are never parsed for an
+expected declaration date.
 """
 import base64, json, os, time
 from datetime import date, datetime, timedelta, timezone
@@ -188,15 +190,20 @@ def _dividend(rec, errs, notes, now):
     """Resolve dividend. Returns the parsed value stored on the record.
 
     Shape: common_fact {amount, ex_date, payment_date} for the next declared dividend, or the sentinels
-    NOT_YET_DECLARED, VERIFIED_NONE, and UNKNOWN. A past ex_date is SCHEMA_INVALID. NOT_YET_DECLARED does
-    not fail the record; it is unresolved risk, like UNKNOWN, and blocks covered calls only. The schema has
-    no expected-declaration date, so notes are not parsed.
+    NOT_YET_DECLARED, VERIFIED_NONE, and UNKNOWN. NOT_YET_DECLARED and VERIFIED_NONE may be a bare string
+    or a sourced common_fact whose value is that sentinel. A wrapped sentinel is checked with the
+    common_fact rules (https source, source type, timestamps); a bad wrapper is SCHEMA_INVALID. A valid
+    wrapped VERIFIED_NONE is no dividend, the same as the bare sentinel. A past ex_date is SCHEMA_INVALID.
+    NOT_YET_DECLARED does not fail the record; it is unresolved risk, like UNKNOWN, and blocks covered
+    calls only. The schema has no expected-declaration date, so notes are not parsed.
     """
     if "dividend" not in rec:
         notes.append("FACT_UNKNOWN:dividend (blocks covered calls only)")
         return "UNKNOWN"
     dv = rec.get("dividend")
-    if dv == "VERIFIED_NONE":
+    if dv == "VERIFIED_NONE" or (isinstance(dv, dict) and dv.get("value") == "VERIFIED_NONE"):
+        if isinstance(dv, dict):
+            _fact(dv, "dividend", errs, True)
         return None
     if dv == "NOT_YET_DECLARED" or (isinstance(dv, dict) and dv.get("value") == "NOT_YET_DECLARED"):
         if isinstance(dv, dict):
