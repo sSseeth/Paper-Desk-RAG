@@ -40,20 +40,23 @@ The journal is SQLite (`data/journal.sqlite3`, WAL). The `events` table is appen
 
 ## Setup
 
-Clone the repository and install into a Python 3.11 virtual environment. On Windows, from PowerShell:
+Clone the repository and install into a Python 3.11 virtual environment. On Windows, from PowerShell, every session must activate that environment with `.\.venv\Scripts\Activate.ps1` before `py desk.py ...`:
 
 ```powershell
 git clone https://github.com/sSseeth/Paper-Desk-RAG.git
 cd Paper-Desk-RAG
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe desk.py setup-secrets
-.\.venv\Scripts\python.exe desk.py self-test
-.\.venv\Scripts\python.exe desk.py doctor
-.\.venv\Scripts\python.exe desk.py cycle --mode DRY_RUN
+.\.venv\Scripts\Activate.ps1
+py desk.py setup-secrets
+py desk.py self-test
+py desk.py doctor
+py desk.py cycle --mode DRY_RUN
 ```
 
 On Linux or macOS the same steps use `python3.11 -m venv .venv` and `./.venv/bin/python`. Run only one machine as the order writer.
+
+Troubleshooting: without `.\.venv\Scripts\Activate.ps1` in that PowerShell session, `keyring` is not importable and `doctor` reports every secret as missing even though Credential Manager has them.
 
 A hash mismatch in `doctor` after cloning on Windows (`core.autocrlf=true` turning `schemas/news_schema_v1.6.json`, `policy.json`, and `watchlist.json` into CRLF) is fixed by `git config core.autocrlf false; git rm --cached -r -q .; git reset --hard`. `.gitattributes` now prevents that conversion on fresh clones.
 
@@ -79,7 +82,7 @@ Leave a prompt blank to keep the value already stored.
 
 ## Commands
 
-Run them as `python desk.py <command>` from the repository root (on Windows, `.\.venv\Scripts\python.exe desk.py <command>`).
+Run them as `python desk.py <command>` from the repository root. On Windows, every PowerShell session must run `.\.venv\Scripts\Activate.ps1` before `py desk.py <command>`.
 
 | Command | What it does |
 | --- | --- |
