@@ -27,6 +27,10 @@ The journal is SQLite (`data/journal.sqlite3`, WAL). The `events` table is appen
 
 `feed_profile` in `policy.json` must be `FREE_MECHANICS` (IEX stock feed, indicative option quotes, labelled INDICATIVE on reports) or `EVALUATION` (SIP and OPRA). There is no silent fallback. An entitlement error blocks; it does not switch profile.
 
+## Safety checks
+
+A new stock entry and a new wheel put on the same symbol are refused. The check runs at the moment of the order and reads both books: filled positions (the stock position table, broker share and option positions, and active wheel cycles, including shares assigned to a cycle), broker orders in any non-terminal status, runner intents the broker has not acknowledged (including `UNKNOWN` after a timeout), and active reserves (wheel put collateral and the stock book's order reserve). The journal records `CROSS_BOOK_OVERLAP:STOCK` or `CROSS_BOOK_OVERLAP:WHEEL`. When the position or open-order read fails, the new entry is skipped and recorded as `CROSS_BOOK_OVERLAP:UNKNOWN`. In one cycle the stock book submits first; a wheel put later in that pass sees the stock intent and skips. A covered call on shares already held by that same wheel cycle stays allowed. Same-book caps and exclusions are unchanged.
+
 ## Requirements
 
 - Python 3.11 or newer
