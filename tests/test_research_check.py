@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 spec = importlib.util.spec_from_file_location("desk", os.path.join(os.path.dirname(__file__), "..", "desk.py"))
 desk = importlib.util.module_from_spec(spec); spec.loader.exec_module(desk)
-FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v16.json")
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v17.json")
 NOW = datetime(2026, 11, 11, 17, 40, tzinfo=timezone.utc)
 
 
@@ -43,7 +43,7 @@ def test_research_check_reports_bridge_file_blocked_with_codes(cfg, journal, cap
     n_events = len(journal.events())
     res = desk.run_research_check(cfg, "o/r", "tok", NOW, session=gh)
     assert res["read_only"] and res["commit"] == "c0ffee1234" and res["error"] is None
-    assert res["schema"]["status"] == "OK" and res["schema"]["pinned_version"] == "news-research-v1.6"
+    assert res["schema"]["status"] == "OK" and res["schema"]["pinned_version"] == "news-research-v1.7"
     assert all(p.get("ref") == "c0ffee1234" for u, p in gh.calls if "/contents/" in u)   # pinned to the commit
     assert not any("x.py" in u for u, _ in gh.calls)
     files = {f["path"]: f for f in res["files"]}

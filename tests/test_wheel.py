@@ -128,3 +128,16 @@ def test_management_actions():
     assert ("BLOCK_ADDITIONS", "10% below acquisition") in W.management_actions(held, stock_mid=134, **base)
     base["earnings_earliest"] = "UNKNOWN"
     assert ("FLAG", "earnings date unknown while short option open") in W.management_actions(put, stock_mid=149, **base)
+
+
+def test_not_yet_declared_dividend_is_not_a_call_buyback():
+    cal = make_calendar("2026-09-01", "2027-01-31")
+    call = {"state": "CALL_OPEN", "data": {"strike": 160.0, "expiry": "2026-12-18", "open_premium": 3.0}}
+    base = dict(now_session_date="2026-11-27", calendar=cal, stock_mid=170.0, opt_bid=0.2, opt_ask=0.4,
+                earnings_earliest="2027-01-20", distress=False, p=P, closing_session_preceding_exdiv=True)
+    for div in ("UNKNOWN", "NOT_YET_DECLARED"):
+        acts = W.management_actions(call, dividend=div, **base)
+        assert not any("dividend exceeds" in why for _, why in acts)
+    declared = {"amount": 5.0, "ex_date": "2026-11-30", "payment_date": "2026-12-02"}
+    acts = W.management_actions(call, dividend=declared, **base)
+    assert ("BUY_TO_CLOSE", "ITM call: dividend exceeds remaining time value") in acts

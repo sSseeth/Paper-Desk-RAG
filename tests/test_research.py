@@ -1,5 +1,5 @@
-"""Schema hash gate (signed v1.6), v1.6 null rules, file/record validation (version, wrapper, stale/UNKNOWN/RUMOUR, wheel card
-created-at clock, both Wheel statuses), polling interval + ETag 304."""
+"""Schema hash gate (signed v1.7), v1.6 null rules, v1.7 guide/dividend/verifier rules, file/record validation
+(version, wrapper, stale/UNKNOWN/RUMOUR, wheel card created-at clock, both Wheel statuses), polling interval + ETag 304."""
 import base64, copy, json, os
 from datetime import datetime, timedelta, timezone
 import pytest
@@ -17,7 +17,7 @@ def fact(v, kind="FILING"):
 
 
 def record(**over):
-    r = {"schema_version": "news-research-v1.6", "symbol": "MU", "exchange": "NASDAQ", "currency": "USD", "universe": "WHEEL",
+    r = {"schema_version": "news-research-v1.7", "symbol": "MU", "exchange": "NASDAQ", "currency": "USD", "universe": "WHEEL",
          "next_earnings": fact({"earliest": "2026-12-17", "latest": "2026-12-17"}),
          "latest_release_date": fact("2026-09-23"), "risk_flags": [], "verification_status": "VERIFIED",
          "verification_reasons": [], "verified_by": "Skeptic", "checked_at_utc": "2026-10-28T12:00:00Z",
@@ -33,7 +33,7 @@ def record(**over):
 
 
 def wrap(*recs, **over):
-    f = {"schema_version": "news-research-v1.6", "published_at_utc": "2026-10-28T12:40:00Z", "publisher": "News",
+    f = {"schema_version": "news-research-v1.7", "published_at_utc": "2026-10-28T12:40:00Z", "publisher": "News",
          "records": list(recs)}
     f.update(over)
     return f
@@ -101,19 +101,21 @@ def test_schema_hash_states(tmp_path):
     ok, st, actual = R.schema_status(root, cfg.policy)
     cfg.policy["research"]["signed_schema_sha256"] = actual
     assert R.schema_status(root, cfg.policy)[:2] == (True, "OK")
-    assert actual == "9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99"
+    assert actual == "a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0"
 
 
-def test_shipped_policy_pins_signed_v16():
+def test_shipped_policy_pins_signed_v17():
     from conftest import ROOT
     p = json.load(open(os.path.join(ROOT, "policy.json")))
-    assert p["research"]["schema_file"] == "schemas/news_schema_v1.6.json"
-    assert p["research"]["signed_schema_sha256"] == "9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99"
+    assert p["research"]["schema_file"] == "schemas/news_schema_v1.7.json"
+    assert p["research"]["signed_schema_sha256"] == "a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0"
     assert R.schema_status(ROOT, p)[:2] == (True, "OK")
+    assert Config(ROOT).config_hash == "2df03f83726ac139"
     sch = json.load(open(os.path.join(ROOT, p["research"]["schema_file"])))
-    assert sch["schema_version"] == R.PINNED_SCHEMA_VERSION
+    assert sch["schema_version"] == R.PINNED_SCHEMA_VERSION == "news-research-v1.7"
     assert "ownership_card_status == VERIFIED" in sch["usable_rule"]
-    for old in ("news_schema_v1.2.json", "news_schema_v1.3.json", "news_schema_v1.5.json"):        # history kept
+    for old in ("news_schema_v1.2.json", "news_schema_v1.3.json", "news_schema_v1.5.json",
+                "news_schema_v1.6.json"):        # history kept
         assert os.path.exists(os.path.join(ROOT, "schemas", old))
 
 
@@ -132,12 +134,12 @@ def _load(journal, cfg, data, path="research/t.json"):
     return R.load_records(journal, cfg, NOW)
 
 
-def test_valid_v16_file_passes(journal, cfg):
+def test_valid_v17_file_passes(journal, cfg):
     recs = _load(journal, cfg, wrap(record()))
     assert recs["MU"][0] is True and recs["MU"][2]["wheel_ok"] is True
 
 
-@pytest.mark.parametrize("over", [{"schema_version": "news-research-v1.5"}, {"schema_version": "news-research-v1.4"}, {"schema_version": "news-research-v1.3"},
+@pytest.mark.parametrize("over", [{"schema_version": "news-research-v1.6"}, {"schema_version": "news-research-v1.5"}, {"schema_version": "news-research-v1.4"}, {"schema_version": "news-research-v1.3"},
                                   {"publisher": "Scout"}, {"published_at_utc": "2026-10-28T12:40:00+10:00"},
                                   {"records": {"MU": 1}}])
 def test_wrong_file_version_or_wrapper_rejected(journal, cfg, over):
@@ -150,7 +152,7 @@ def test_bare_record_or_list_rejected(journal, cfg):
     assert _load(journal, cfg, [record()], "b") == {}
 
 
-@pytest.mark.parametrize("ver", ["news-research-v1.5", "news-research-v1.4", None])
+@pytest.mark.parametrize("ver", ["news-research-v1.6", "news-research-v1.5", "news-research-v1.4", None])
 def test_wrong_record_version_rejected(ver):
     r = record(schema_version=ver)
     ok, errs, out = v(r)
@@ -260,9 +262,9 @@ def test_v15_closed_the_page18_gaps():
     assert "card_created_at_utc" in R.WHEEL_REQ and "ocf_filing_date" in R.WHEEL_REQ and "schema_version" in R.REC_REQ
 
 
-# ---- News's bridge test file as v1.6 (tests/fixtures/news_bridge_test_v16.json: the v1.5 file with only
-# schema_version changed). Its UNKNOWN facts carry null source fields, which v1.6 allows. ----
-FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v16.json")
+# ---- News's bridge test file as v1.7 (tests/fixtures/news_bridge_test_v17.json: the v1.6 file with only
+# schema_version changed). Its UNKNOWN facts carry null source fields, which v1.6/v1.7 allow. ----
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v17.json")
 FACTS_REC = ("next_earnings", "latest_release_date", "dividend")
 FACTS_CARD = ("latest_annual_operating_cash_flow", "ocf_filing_date", "paper_universe_eligible",
               "going_concern_flag", "bankruptcy_flag")
@@ -335,8 +337,7 @@ def test_file_level_codes(journal, cfg):
     assert json.loads(ev["payload"])["codes"] == ["VERSION_MISMATCH"]
 
 
-# ---- v1.6 null rules (Skeptic-signed 9558c999...) ----
-FIXTURE_V15 = os.path.join(os.path.dirname(__file__), "fixtures", "news_bridge_test_v15.json")
+# ---- v1.6 null rules, still in force under the v1.7 pin ----
 
 
 @pytest.mark.parametrize("key", NULL_KEYS)
@@ -386,8 +387,9 @@ def test_v16_verified_by_null_allowed_while_verified_at_null():
 @pytest.mark.parametrize("status,expected", [
     ("VERIFIED", ["VERIFIED_AT_MISSING", "SCHEMA_INVALID:verified_by"]),
     ("INVALID", ["NOT_VERIFIED:INVALID", "SCHEMA_INVALID:verified_by"]),
+    ("UNKNOWN", ["NOT_VERIFIED:UNKNOWN", "SCHEMA_INVALID:verified_by"]),
 ])
-def test_v16_verified_by_required_for_verified_or_invalid(status, expected):
+def test_v17_verified_by_required_for_every_skeptic_verdict(status, expected):
     ok, errs, _ = v(record(verification_status=status, verified_by=None, verified_at_utc=None))
     assert not ok and sorted(errs) == sorted(expected), errs
 
@@ -397,6 +399,122 @@ def test_v16_verified_by_must_still_be_skeptic():
     assert v(record(verified_by=7))[1] == ["SCHEMA_INVALID:verified_by"]
 
 
-def test_v15_bridge_file_now_rejected_as_version_mismatch(cfg):
-    rep = R.check_text(open(FIXTURE_V15).read(), cfg, datetime(2026, 11, 11, 17, 40, tzinfo=timezone.utc))
+@pytest.mark.parametrize("name", ["news_bridge_test_v15.json", "news_bridge_test_v16.json"])
+def test_older_bridge_file_rejected_as_version_mismatch(cfg, name):
+    path = os.path.join(os.path.dirname(__file__), "fixtures", name)
+    rep = R.check_text(open(path).read(), cfg, datetime(2026, 11, 11, 17, 40, tzinfo=timezone.utc))
     assert rep["file_status"] == "REJECTED" and rep["file_codes"] == ["VERSION_MISMATCH"]
+
+
+# ---- v1.7 rules (Skeptic-signed a3b4c226...) ----
+def guide_fact(value, url="https://example.com/guide_v2.pdf", kind="INTERNAL_POLICY"):
+    f = fact(value)
+    f["source_type"] = "INTERNAL_GUIDE"
+    f["evidence_kind"] = kind
+    f["source_url"] = url
+    return f
+
+
+def test_v17_internal_guide_https_backs_only_paper_universe_eligible():
+    ok, errs, out = v(record(paper_universe_eligible=guide_fact(True)))
+    assert ok and out["wheel_ok"], (errs, out["wheel_reasons"])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("next_earnings", {"earliest": "2026-12-17", "latest": "2026-12-17"}),
+    ("latest_release_date", "2026-09-23"),
+    ("ocf_filing_date", "2026-10-03"),
+    ("going_concern_flag", "FALSE"),
+])
+def test_v17_internal_guide_on_other_facts_is_invalid(field, value):
+    ok, errs, out = v(record(**{field: guide_fact(value)}))
+    codes = errs + out["wheel_reasons"]
+    assert f"SCHEMA_INVALID:{field}.source_type" in codes, codes
+    assert f"SCHEMA_INVALID:{field}.evidence_kind" in codes, codes
+
+
+def test_v17_internal_guide_file_url_is_schema_invalid():
+    # INTERNAL_GUIDE is allowed on this fact; file:// is not, for any source type.
+    ok, errs, out = v(record(paper_universe_eligible=guide_fact(True, url="file:///guide_v2.pdf")))
+    assert ok and not out["wheel_ok"], errs
+    assert "SCHEMA_INVALID:paper_universe_eligible.source_url" in out["wheel_reasons"]
+    assert "SCHEMA_INVALID:paper_universe_eligible.source_type" not in out["wheel_reasons"]
+
+
+def test_v17_internal_policy_on_a_risk_flag_is_invalid():
+    ok, errs, _ = v(record(risk_flags=[guide_fact("dilution")]))
+    assert not ok and "SCHEMA_INVALID:risk_flags[0].source_type" in errs, errs
+    assert "SCHEMA_INVALID:risk_flags[0].evidence_kind" in errs
+
+
+def test_v17_unknown_verdict_with_skeptic_is_only_not_verified():
+    ok, errs, _ = v(record(verification_status="UNKNOWN", verified_by="Skeptic"))
+    assert not ok and errs == ["NOT_VERIFIED:UNKNOWN"], errs
+    ok, errs, _ = v(record(verification_status="UNKNOWN", verified_by="Skeptic", verified_at_utc=None))
+    assert "SCHEMA_INVALID:verified_by" not in errs and "NOT_VERIFIED:UNKNOWN" in errs
+
+
+def _div(ex, **extra):
+    body = {"amount": 0.25, "ex_date": ex, "payment_date": "2026-12-01"}
+    body.update(extra)
+    return fact(body)
+
+
+def test_v17_future_ex_date_accepted_and_past_ex_date_invalid():
+    ok, errs, out = v(record(dividend=_div("2026-11-17")))
+    assert ok and out["wheel_ok"] and out["dividend"]["ex_date"] == "2026-11-17", errs
+    ok, errs, out = v(record(dividend=_div("2026-10-28")))          # today is not past
+    assert ok and out["dividend"]["ex_date"] == "2026-10-28", errs
+    ok, errs, out = v(record(dividend=_div("2026-10-28T14:15:00Z")))  # equal to now: not before now
+    assert ok and out["dividend"]["ex_date"] == "2026-10-28T14:15:00Z", errs
+    ok, errs, _ = v(record(dividend=_div("2026-10-27")))
+    assert not ok and errs == ["SCHEMA_INVALID:dividend.ex_date"], errs
+    ok, errs, _ = v(record(dividend=_div("2026-10-28T14:14:00Z")))
+    assert not ok and "SCHEMA_INVALID:dividend.ex_date" in errs, errs
+    ok, errs, _ = v(record(dividend=fact({"ex_date": "2026-11-17"})))
+    assert not ok and "SCHEMA_INVALID:dividend" in errs, errs
+
+
+def test_v17_not_yet_declared_is_unresolved_and_ignores_notes():
+    notes = "NVDA expected declaration 17 Nov 2026; last paid 2026-09-15"
+    bare_ok, _, bare = v(record(dividend="NOT_YET_DECLARED"))
+    fact_ok, _, parsed = v(record(dividend=dict(fact("NOT_YET_DECLARED"), notes=notes)))
+    assert bare_ok and bare["wheel_ok"] and bare["dividend"] == "NOT_YET_DECLARED"
+    assert fact_ok and parsed["wheel_ok"] and parsed["dividend"] == "NOT_YET_DECLARED"
+    assert bare["notes"] == parsed["notes"] == ["DIVIDEND_NOT_YET_DECLARED (blocks covered calls only)"]
+    assert "17 Nov" not in json.dumps(parsed["dividend"])
+    # null source fields stay illegal: NOT_YET_DECLARED is not UNKNOWN
+    ok, errs, _ = v(record(dividend=dict(fact("NOT_YET_DECLARED"), source_url=None)))
+    assert not ok and "SCHEMA_INVALID:dividend.source_url" in errs, errs
+
+
+def test_v17_not_yet_declared_blocks_covered_call_and_unknown_still_does(cfg, journal, monkeypatch):
+    from sakibdesk.calendar_util import Session
+    from sakibdesk import cycle as C
+    sess = Session({"date": "2026-10-28", "open": "09:30", "close": "16:00"})
+    now = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)       # inside the wheel entry window
+    journal.db.execute("INSERT INTO wheel_cycles VALUES(?,?,?,?,?,?)",
+                       ("C1", "MU", "SHARES_HELD", "{}", "", ""))
+    # Fill the active-cycle cap so the test stops after the covered-call gate and does not screen puts.
+    journal.db.execute("INSERT INTO wheel_cycles VALUES(?,?,?,?,?,?)",
+                       ("C2", "AMD", "PUT_OPEN", "{}", "", ""))
+    allowed, wheel = set(cfg.us_symbols), set(cfg.wheel_symbols)
+
+    def rows(div):
+        ok, errs, out = R.validate_record(record(dividend=div), allowed, wheel, now)
+        assert ok and out["wheel_ok"], (errs, out["wheel_reasons"])
+        return {"MU": (ok, errs, out)}
+
+    summary = {}
+    C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
+                    rows("NOT_YET_DECLARED"), summary)
+    C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
+                    rows("UNKNOWN"), summary)
+    reasons = [json.loads(e["payload"])["reason"] for e in journal.events("GATE_FAIL")]
+    assert reasons == ["DIVIDEND_NOT_YET_DECLARED", "call blocked (research/dividend/loss block)"]
+    monkeypatch.setattr(C, "_sell_option", lambda *a, **k: True)
+    C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
+                    rows("VERIFIED_NONE"), summary)
+    C.wheel_entries(cfg, journal, None, None, None, None, sess, "2026-10-28", now,
+                    rows(_div("2026-11-17")), summary)
+    assert [json.loads(e["payload"])["reason"] for e in journal.events("GATE_FAIL")] == reasons

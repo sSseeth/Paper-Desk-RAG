@@ -20,12 +20,12 @@
     {
       "check": "Research schema",
       "status": "tested-offline",
-      "reason": "Skeptic-signed News schema v1.6 is pinned: schemas/news_schema_v1.6.json, policy.research.signed_schema_sha256 = 9558c999efce6039f7df942a5b1798feff4eb998cd2fc62ea123b3ba71821a99 (file must also say news-research-v1.6). v1.6 changes only the null rules: a fact's source fields may be null only when its value is UNKNOWN, and verified_by may be null only while verified_at_utc is null. The validator enforces both, with offline positive and negative tests. v1.5, v1.3 and v1.2 kept for history and not accepted."
+      "reason": "Skeptic-signed News schema v1.7 is pinned: schemas/news_schema_v1.7.json, policy.research.signed_schema_sha256 = a3b4c2264350807286308af60613d106e021eedcb6e0d6b51acd3a4c9e31c2d0 (file must also say news-research-v1.7). v1.6 null rules still hold. v1.7 adds INTERNAL_GUIDE and INTERNAL_POLICY, allowed only on paper_universe_eligible, with https:// source URLs only. verified_by must be Skeptic for VERIFIED, INVALID, and UNKNOWN. A past dividend ex_date is SCHEMA_INVALID. NOT_YET_DECLARED blocks covered-call entry with DIVIDEND_NOT_YET_DECLARED and is otherwise treated like UNKNOWN. Offline positive and negative tests cover these rules. v1.6, v1.5, v1.3 and v1.2 are kept for history and are not accepted."
     },
     {
       "check": "Research bridge",
       "status": "blocked",
-      "reason": "News publishes research to the private research repo. The read-only `desk.py research-check` has not yet been run against v1.6 records, so no symbol has usable VERIFIED research and new entries stay blocked."
+      "reason": "News publishes research to the private research repo. The read-only `desk.py research-check` has not yet been run against v1.7 records, so no symbol has usable VERIFIED research and new entries stay blocked."
     },
     {
       "check": "Order safety",
@@ -65,7 +65,7 @@
     {
       "check": "AUTO_PAPER",
       "status": "blocked",
-      "reason": "Off. The desk is used manually. AUTO_PAPER stays off until research-check passes on v1.6 and the page 20 stock and Wheel lifecycle checks pass."
+      "reason": "Off. The desk is used manually. AUTO_PAPER stays off until research-check passes on v1.7 and the page 20 stock and Wheel lifecycle checks pass."
     }
   ]
 }

@@ -480,9 +480,14 @@ def wheel_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records
         if c["state"] != "SHARES_HELD":
             continue
         rec = records.get(c["symbol"])
-        if not rec or not rec[0] or not rec[2].get("wheel_ok") or rec[2].get("dividend") == "UNKNOWN" \
+        div = rec[2].get("dividend") if rec else None
+        # NOT_YET_DECLARED is unresolved, like UNKNOWN: always block the covered call. There is no
+        # structured expected-declaration date, so notes are not consulted.
+        if not rec or not rec[0] or not rec[2].get("wheel_ok") or div in ("UNKNOWN", "NOT_YET_DECLARED") \
                 or journal.get(f"wheel_block:{c['symbol']}"):
-            journal.event("GATE_FAIL", {"reason": "call blocked (research/dividend/loss block)"}, "WHEEL", c["symbol"])
+            reason = ("DIVIDEND_NOT_YET_DECLARED" if div == "NOT_YET_DECLARED"
+                      else "call blocked (research/dividend/loss block)")
+            journal.event("GATE_FAIL", {"reason": reason}, "WHEEL", c["symbol"])
             continue
         _sell_option(cfg, journal, om, deps, cal, today, now, c["symbol"], rec[2], "call", c, base, summary)
     # new puts

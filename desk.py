@@ -315,7 +315,7 @@ def cmd_snapshot(cfg):
 
 def run_research_check(cfg, repo, token, now, session=None):
     """Read-only bridge check: GET research/*.json from the repo (pinned to the latest research/ commit), validate
-    each file against the pinned v1.6 rules and return per-file / per-record results with reason codes.
+    each file against the pinned v1.7 rules and return per-file / per-record results with reason codes.
     Never trades, never writes to GitHub, never touches the journal (so the card-immutability check, which needs
     the journal's memory of earlier cards, is not applied here)."""
     ok, why, actual = R.schema_status(cfg.root, cfg.policy)
