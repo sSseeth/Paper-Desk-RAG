@@ -55,6 +55,8 @@ py -3.11 -m venv .venv
 
 On Linux or macOS the same steps use `python3.11 -m venv .venv` and `./.venv/bin/python`. Run only one machine as the order writer.
 
+A hash mismatch in `doctor` after cloning on Windows (`core.autocrlf=true` turning `schemas/news_schema_v1.6.json`, `policy.json`, and `watchlist.json` into CRLF) is fixed by `git config core.autocrlf false; git rm --cached -r -q .; git reset --hard`. `.gitattributes` now prevents that conversion on fresh clones.
+
 ## Secrets
 
 `desk.py setup-secrets` prompts for each value and stores it in the OS keyring under the service name `SakibPaperDesk`. Secret values use a hidden prompt. They are never taken from command-line arguments, source files, or logs. Do not put them in the repository, in a `.env` file, or in a shell history.
