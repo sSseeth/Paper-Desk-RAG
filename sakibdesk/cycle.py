@@ -9,7 +9,7 @@ from . import stock as S, wheel as W, research as R
 from .calendar_util import current_session, sessions, session_offset
 from .journal import iso
 from .ledger import Ledger
-from .orders import OrderManager
+from .orders import FINAL_STATES, OrderManager
 from .risk import RiskState
 from .alpaca import BrokerError, FeedNotEntitled
 
@@ -273,6 +273,174 @@ def _bars_start(today):
     return (date.fromisoformat(today) - timedelta(days=420)).isoformat()
 
 
+class ExposureUnknown(Exception):
+    """Positions or open orders could not be read, so book exposure is unknown."""
+
+
+# A wheel cycle in one of these states holds the underlying shares. Those shares are the cycle.
+_SHARE_STATES = frozenset({
+    "ASSIGNMENT_PENDING", "SHARES_HELD", "CALL_PENDING", "CALL_OPEN", "CALL_CLOSING",
+    "CALL_ASSIGNMENT_PENDING", "UNWINDING",
+})
+
+
+def _position_qty(pos):
+    raw = pos.get("qty") if isinstance(pos, dict) else None
+    if raw is None or raw == "":
+        raise ExposureUnknown("broker position is missing qty")
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ExposureUnknown("broker position qty is unreadable") from exc
+
+
+def _option_underlying(symbol, asset_class=None):
+    """Underlying of an OCC option, or None when `symbol` is an equity."""
+    if symbol is None:
+        return None
+    text = str(symbol).strip()
+    if not text:
+        return None
+    parsed = W.parse_occ(text)
+    if parsed:
+        return parsed["underlying"]
+    if asset_class == "us_option" or len(text) > 10:
+        raise ExposureUnknown("option symbol is not a parseable OCC symbol")
+    return None
+
+
+def _equity_symbol(symbol):
+    if symbol is None:
+        return None
+    text = str(symbol).strip()
+    return text or None
+
+
+def symbol_exposure(journal, om, ledger, positions, orders):
+    """Map a symbol to the books that already have exposure on it.
+
+    Each book is included when any of these is present for that symbol:
+    a filled position, a non-terminal broker order, a runner intent the broker
+    has not acknowledged (``OrderManager.open_intents``, which keeps UNKNOWN
+    after a timeout), or an ACTIVE reservation. Wheel put collateral
+    (``PUT_COLLATERAL``) is the assignment reserve. Shares held by a wheel
+    cycle stay on the wheel book. Intents and reservations are read from the
+    journal on every call, so the book that decides second in a pass sees an
+    intent the first book just wrote.
+
+    ``positions`` or ``orders`` is None when that broker read failed.
+
+    Raises:
+        ExposureUnknown: inputs are missing, or a row cannot be attributed.
+    """
+    if journal is None or om is None or ledger is None or ledger.j is not journal:
+        raise ExposureUnknown("exposure inputs are missing or inconsistent")
+    if positions is None or orders is None:
+        raise ExposureUnknown("broker positions or open orders are unavailable")
+    books = {}
+
+    def add(symbol, book):
+        if symbol and book in ("STOCK", "WHEEL"):
+            books.setdefault(symbol, set()).add(book)
+
+    for row in journal.db.execute("SELECT symbol FROM stock_positions"):
+        add(row["symbol"], "STOCK")
+    share_held = set()
+    for cyc in cycles(journal):
+        add(cyc["symbol"], "WHEEL")
+        if cyc["state"] in _SHARE_STATES:
+            share_held.add(cyc["symbol"])
+    for pos in positions:
+        if not isinstance(pos, dict):
+            raise ExposureUnknown("broker position is unreadable")
+        symbol = _equity_symbol(pos.get("symbol"))
+        if not symbol:
+            raise ExposureUnknown("broker position is missing a symbol")
+        if _position_qty(pos) == 0:
+            continue
+        asset = pos.get("asset_class")
+        underlying = _option_underlying(symbol, asset)
+        if underlying:
+            add(underlying, "WHEEL")
+            continue
+        if asset not in (None, "us_equity"):
+            raise ExposureUnknown("broker position asset class is unrecognized")
+        if symbol in share_held:
+            add(symbol, "WHEEL")
+        else:
+            add(symbol, "STOCK")
+    for order in orders:
+        if not isinstance(order, dict):
+            raise ExposureUnknown("broker order is unreadable")
+        # FINAL_STATES is terminal. Every other status, including OPEN_STATES, is still working.
+        if order.get("status") in FINAL_STATES:
+            continue
+        symbol = _equity_symbol(order.get("symbol"))
+        if not symbol:
+            raise ExposureUnknown("open broker order is missing a symbol")
+        underlying = _option_underlying(symbol, order.get("asset_class"))
+        if underlying:
+            add(underlying, "WHEEL")
+            continue
+        cid = order.get("client_order_id")
+        intent = om.intent(cid) if cid else None
+        if intent is not None and intent["strategy"] == "WHEEL":
+            root = _option_underlying(intent["symbol"]) or _equity_symbol(intent["symbol"])
+            add(root, "WHEEL")
+            continue
+        add(symbol, "STOCK")
+    for intent in om.open_intents():
+        if not intent["symbol"]:
+            raise ExposureUnknown("open intent is missing a symbol")
+        root = _option_underlying(intent["symbol"]) or _equity_symbol(intent["symbol"])
+        add(root, intent["strategy"])
+    for row in journal.db.execute(
+            "SELECT ledger, symbol, amount FROM reservations WHERE status='ACTIVE'"):
+        try:
+            amount = float(row["amount"] if row["amount"] is not None else 0)
+        except (TypeError, ValueError) as exc:
+            raise ExposureUnknown("reservation amount is unreadable") from exc
+        if amount <= 0:
+            continue
+        if not row["symbol"]:
+            raise ExposureUnknown("active reservation is missing a symbol")
+        root = _option_underlying(row["symbol"]) or _equity_symbol(row["symbol"])
+        add(root, row["ledger"])
+    return books
+
+
+def _load_broker_books(reader):
+    """Return (positions, orders). Raises ExposureUnknown when the read fails."""
+    if reader is None:
+        raise ExposureUnknown("broker reader unavailable")
+    try:
+        positions = reader.positions()
+        orders = reader.orders("open")
+    except BrokerError as exc:
+        raise ExposureUnknown(str(exc)) from exc
+    if not isinstance(positions, list) or not isinstance(orders, list):
+        raise ExposureUnknown("broker positions or open orders are unavailable")
+    return positions, orders
+
+
+def _cross_book_reason(journal, om, ledger, reader, symbol, entering):
+    """Skip code when `entering` must not open `symbol`, otherwise None.
+
+    Broker orders and journal intents are loaded here, at the moment of the
+    decision, so a snapshot taken at the start of the pass cannot hide an
+    intent the other book already submitted.
+    """
+    try:
+        positions, orders = _load_broker_books(reader)
+        books = symbol_exposure(journal, om, ledger, positions, orders)
+    except ExposureUnknown:
+        return "CROSS_BOOK_OVERLAP:UNKNOWN"
+    other = "STOCK" if entering == "WHEEL" else "WHEEL"
+    if other in books.get(symbol, ()):
+        return f"CROSS_BOOK_OVERLAP:{other}"
+    return None
+
+
 def stock_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records, summary):
     p = cfg.policy["stock"]
     if not sess.in_window(now, p["entry_window_start_min"], p["entry_window_end_min"]):
@@ -308,6 +476,11 @@ def stock_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records
     quotes = deps.md.latest_quotes([c["symbol"] for c in picks]) if picks else {}
     for c in picks:
         sym, q = c["symbol"], quotes.get(c["symbol"])
+        overlap = _cross_book_reason(journal, om, ledger, deps.reader if deps is not None else None,
+                                     sym, "STOCK")
+        if overlap:
+            journal.event("GATE_FAIL", {"reason": overlap}, "STOCK", sym)
+            continue
         ok, why = S.quote_ok(q, now, p["quote_max_age_sec"], p["max_spread_pct_of_mid"]) if q else (False, "no quote")
         if not ok:
             journal.event("GATE_FAIL", {"reason": why}, "STOCK", sym); continue
@@ -504,6 +677,12 @@ def wheel_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records
         if not rec or not rec[0] or not rec[2].get("wheel_ok") or journal.get(f"wheel_block:{sym}"):
             journal.event("GATE_FAIL", {"reason": "wheel card/research not usable",
                                         "detail": rec and (rec[1] + rec[2].get("wheel_reasons", []))}, "WHEEL", sym)
+            continue
+        # Read intents now. The stock book submits earlier in this same pass.
+        overlap = _cross_book_reason(journal, om, ledger, deps.reader if deps is not None else None,
+                                     sym, "WHEEL")
+        if overlap:
+            journal.event("GATE_FAIL", {"reason": overlap}, "WHEEL", sym)
             continue
         if _sell_option(cfg, journal, om, deps, cal, today, now, sym, rec[2], "put", None, base, summary,
                         bars=S.completed_bars(bars.get(sym, []), today)):
