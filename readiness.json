@@ -35,12 +35,12 @@
     {
       "check": "Stock lifecycle",
       "status": "blocked",
-      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits implemented and mock-tested. Guide page 20 lifecycle checks on a separate mechanics paper account have not been run."
+      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits implemented and mock-tested. The lifecycle gate is now enforced in code: main-account AUTO_PAPER stays refused until stock_lifecycle is recorded from a separate mechanics paper account. Guide page 20 checks on that account have not been run."
     },
     {
       "check": "Wheel lifecycle",
       "status": "blocked",
-      "reason": "State machine, screen, collateral, buyback and covered calls mock-tested. Guide page 20 lifecycle checks on a separate mechanics paper account have not been run, and real expiries take days to weeks. Label PROVISIONAL."
+      "reason": "State machine, screen, collateral, buyback and covered calls mock-tested. The lifecycle gate is now enforced in code: main-account AUTO_PAPER stays refused until wheel_lifecycle is recorded from a separate mechanics paper account. Guide page 20 checks have not been run, and real expiries take days to weeks. Label PROVISIONAL."
     },
     {
       "check": "Assignment limits",
@@ -65,7 +65,7 @@
     {
       "check": "AUTO_PAPER",
       "status": "blocked",
-      "reason": "Off. The desk is used manually. AUTO_PAPER stays off until research-check passes on v1.7 and the page 20 stock and Wheel lifecycle checks pass."
+      "reason": "Off. The desk is used manually. The lifecycle gate is now enforced in code: AUTO_PAPER on the main account is refused until both the stock and Wheel lifecycle checks are recorded from the separate mechanics paper account. Research-check on v1.7 is also still required before new entries. DRY_RUN is not gated."
     }
   ]
 }

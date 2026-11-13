@@ -55,8 +55,8 @@ def deliver(journal, url, bearer, session=None, now=None):
     return {"sent": sent}
 
 
-def write_local(root, cfg, journal, summary, session_label):
-    d = os.path.join(root, "reports")
+def write_local(root, cfg, journal, summary, session_label, directory=None):
+    d = directory or os.path.join(root, "reports")
     os.makedirs(d, exist_ok=True)
     st = stamp(cfg)
     csv_path = os.path.join(d, f"events_{session_label}.csv")

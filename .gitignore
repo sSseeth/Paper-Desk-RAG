@@ -16,7 +16,9 @@ htmlcov/
 # Runtime output. The journal (including the outbox table) is SQLite under data/,
 # with WAL/SHM sidecars. The lock, redacted cycle log, and keyring-fallback
 # secrets file live there too. reports/ and logs/ are written by desk.py and
-# the scheduler launchers. state/ is reserved for local runtime state.
+# the scheduler launchers. state/ is local runtime state, including
+# state/lifecycle_gate.json (sha256 prefix only; never a raw account id).
+# data/mechanics/ and reports/mechanics/ belong to the mechanics paper account.
 data/
 reports/
 logs/
