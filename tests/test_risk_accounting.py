@@ -20,7 +20,7 @@ def test_healthy_streak(cfg, journal):
 
 def test_resume_refused_without_streak_or_with_block(monkeypatch, cfg, journal):
     import desk
-    monkeypatch.setattr(desk, "_doctor_ok", lambda cfg: True, raising=False)
+    monkeypatch.setattr(desk, "_doctor_ok", lambda cfg, account="main": True, raising=False)
     journal.set("paused", True); journal.set("healthy_streak", 1)
     assert desk.resume_allowed(journal, cfg)[0] is False
     journal.set("healthy_streak", 3); journal.set("experiment_block", True)

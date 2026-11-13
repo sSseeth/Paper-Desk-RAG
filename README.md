@@ -44,21 +44,17 @@ A new stock entry and a new wheel put on the same symbol are refused. The check 
 
 ## Setup
 
-Clone the repository and install into a Python 3.11 virtual environment. On Windows, from PowerShell, every session must activate that environment with `.\.venv\Scripts\Activate.ps1` before `py desk.py ...`:
+Clone `https://github.com/sSseeth/Paper-Desk-RAG.git` and change into that directory. Create a virtual environment with Python 3.11 or newer and install `requirements.txt`. On Windows use `py -m venv .venv` and `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`. On Linux or macOS use `python3 -m venv .venv` and `./.venv/bin/python -m pip install -r requirements.txt`. Run only one machine as the order writer.
+
+On Windows, from PowerShell, every session must activate that environment with `.\.venv\Scripts\Activate.ps1` before `py desk.py ...`:
 
 ```powershell
-git clone https://github.com/sSseeth/Paper-Desk-RAG.git
-cd Paper-Desk-RAG
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\Activate.ps1
 py desk.py setup-secrets
 py desk.py self-test
 py desk.py doctor
 py desk.py cycle --mode DRY_RUN
 ```
-
-On Linux or macOS the same steps use `python3.11 -m venv .venv` and `./.venv/bin/python`. Run only one machine as the order writer.
 
 Troubleshooting: without `.\.venv\Scripts\Activate.ps1` in that PowerShell session, `keyring` is not importable and `doctor` reports every secret as missing even though Credential Manager has them.
 
@@ -70,7 +66,7 @@ A hash mismatch in `doctor` after cloning on Windows (`core.autocrlf=true` turni
 
 If the machine has no keyring backend, the command falls back to `data/secrets.local.json` with mode `0600` (and a user-only ACL on Windows). That file is gitignored. Prefer a real keyring so the values stay out of the tree. A file that is readable by group or other is rejected.
 
-`doctor` expects all seven names to be present:
+`doctor` on the main account expects all seven names to be present:
 
 | Name | Prompt | Purpose |
 | --- | --- | --- |
@@ -84,22 +80,57 @@ If the machine has no keyring backend, the command falls back to `data/secrets.l
 
 Leave a prompt blank to keep the value already stored.
 
+## Mechanics account
+
+Stock and Wheel lifecycle checks run on a second Alpaca paper account, not on the main evaluation account. Create that paper account, then store its key id, secret, and expected account id under separate names in the same `SakibPaperDesk` keyring service. `--account` defaults to `main`. `main` keeps `ALPACA_PAPER_KEY_ID`, `ALPACA_PAPER_SECRET`, and `ALPACA_EXPECTED_ACCOUNT_ID`.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py setup-secrets --account mechanics
+py desk.py doctor --account mechanics
+```
+
+`setup-secrets --account mechanics` prompts only for these names, and every prompt is hidden (nothing is echoed):
+
+| Name | Purpose |
+| --- | --- |
+| `MECH_ALPACA_PAPER_KEY_ID` | Mechanics paper API key id |
+| `MECH_ALPACA_PAPER_SECRET` | Mechanics paper API secret |
+| `MECH_ALPACA_EXPECTED_ACCOUNT_ID` | Mechanics account UUID or `PA…` account number |
+
+`doctor --account mechanics` checks those three broker secrets, the hard-coded paper host, and that the broker account matches the mechanics expected id. It does not require the main account's secrets. The command refuses when the mechanics expected account id equals the main expected account id, and when the account the broker returns does not match the selected profile.
+
+Mechanics orders, the journal, and reports stay apart from the main book: `data/mechanics/journal.sqlite3` and `reports/mechanics/`. The main journal stays `data/journal.sqlite3` and main reports stay in `reports/`. The paper host stays `https://paper-api.alpaca.markets`. There is no live endpoint.
+
+After the checks have been observed on the mechanics account, record them. This command refuses `--account main`. It reads the mechanics account and does not submit or cancel orders. Do not put the account id in `--evidence`.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py lifecycle-record --account mechanics --check stock --evidence "stock bracket lifecycle observed"
+py desk.py lifecycle-record --account mechanics --check wheel --evidence "wheel lifecycle observed"
+```
+
+The record is `state/lifecycle_gate.json` (gitignored). Each of `stock_lifecycle` and `wheel_lifecycle` stores the UTC time, a 16-character sha256 prefix of the mechanics expected account id, the runner git commit, the config hash, and the evidence note. The raw account id is not written. A missing or corrupt file is not a pass.
+
+`cycle --mode AUTO_PAPER` on the main account (the default, including `run-paper.cmd` and `run-paper.sh`) refuses with journal event `AUTO_PAPER_REFUSED` and reason `LIFECYCLE_GATE_NOT_PASSED` until both checks are recorded. `cycle --mode AUTO_PAPER --account mechanics` is not gated, so the checks themselves run there. `DRY_RUN` is never gated. `doctor` on main prints `lifecycle_gate` as `PASS` or `BLOCKED`. `BLOCKED` does not fail doctor.
+
 ## Commands
 
-Run them as `python desk.py <command>` from the repository root. On Windows, every PowerShell session must run `.\.venv\Scripts\Activate.ps1` before `py desk.py <command>`.
+Run them as `py desk.py <command>` from the repository root. On Windows, every PowerShell session must run `.\.venv\Scripts\Activate.ps1` before `py desk.py <command>`. Broker commands take `--account main` (the default) or `--account mechanics`.
 
 | Command | What it does |
 | --- | --- |
-| `setup-secrets` | Prompt for the seven secrets and store them in the OS keyring. |
-| `doctor` | Check the config hash, hard-coded paper host, feed profile, pinned schema hash, and secrets. When every secret is present, also read the paper account, clock, and a SPY quote. Exit 0 when every check passes, 2 otherwise. Nothing is sent. |
+| `setup-secrets` | Prompt for the main seven secrets, or with `--account mechanics` the three `MECH_ALPACA_*` secrets, and store them in the OS keyring. |
+| `doctor` | Check the config hash, hard-coded paper host, feed profile, pinned schema hash, and that profile's secrets. When those secrets are present, also read the paper account, clock, and a SPY quote. On main, also prints `lifecycle_gate` `PASS` or `BLOCKED` (BLOCKED does not fail doctor). Exit 0 when every check passes, 2 otherwise. Nothing is sent. |
 | `self-test` | Print the config and schema status, then run the offline pytest suite. The exit code is pytest's. |
-| `report` | Write the local HTML and CSV reports from the journal and try to deliver pending outbox events. Does not trade. |
-| `snapshot` | Read-only account, ledger, position, open-order, and covered-call snapshot. Refuses if any secret is missing. Saves `reports/snapshot_<date>.json`. Never constructs an order writer. |
+| `report` | Write the local HTML and CSV reports from that profile's journal and try to deliver pending outbox events. Does not trade. |
+| `snapshot` | Read-only account, ledger, position, open-order, and covered-call snapshot. Refuses if that profile's broker secrets are missing, if the two expected account ids match, or if the broker account does not match. Saves `reports/snapshot_<date>.json` (mechanics: `reports/mechanics/`). Never constructs an order writer. |
 | `research-check` | Read-only fetch of `research/*.json`, validated against the pinned schema. Needs `GITHUB_RESEARCH_REPO` and `GITHUB_READONLY_TOKEN`. Saves `reports/research_check_<date>.json`. Does not trade, write to GitHub, or touch the journal. |
-| `pause` | Block new entries. Later cycles still reconcile and manage exits. Cancels pending entry orders when paper credentials can build a writer. |
+| `pause` | Block new entries. Later cycles still reconcile and manage exits. Cancels pending entry orders when paper credentials can build a writer. Refuses if the selected broker account does not match. |
 | `resume` | Clear the pause only when `doctor` passes, the experiment drawdown block is off, and three consecutive healthy reconciliations are on record. A daily loss block for the current session still applies. |
-| `flatten` | Pause and work the paper book toward flat: confirm cancels, buy back short calls before short puts, and sell long shares only once no short calls remain. Refuses without credentials. Does not claim completion until fills reconcile. |
-| `cycle --mode DRY_RUN\|AUTO_PAPER` | Run one cycle under a process lock. `--mode` is required. |
+| `flatten` | Pause and work the selected paper book toward flat: confirm cancels, buy back short calls before short puts, and sell long shares only once no short calls remain. Refuses without credentials or on an account mismatch. Does not claim completion until fills reconcile. |
+| `lifecycle-record --check stock\|wheel --evidence "..."` | Mechanics only. After read-only checks pass, record that lifecycle check in `state/lifecycle_gate.json`. Refuses `--account main`. |
+| `cycle --mode DRY_RUN\|AUTO_PAPER` | Run one cycle under a process lock. `--mode` is required. Main `AUTO_PAPER` also requires the lifecycle gate. |
 
 If `data/desk.lock` is already held, `cycle` prints a message and exits 0 without sending orders. `flatten` takes the same lock after the credential check and does not catch a busy lock, so a second flatten fails instead of sending another batch.
 
@@ -108,7 +139,7 @@ If `data/desk.lock` is already held, `cycle` prints a message and exits 0 withou
 `cycle` has two modes and no default. You pass one.
 
 - **DRY_RUN.** No `PaperWriter` is constructed, so the process has no object that can submit or cancel an order. Intents that would have been sent are recorded with status `DRY_RUN` and nothing goes to the broker. Use this while checking secrets, research, and the log.
-- **AUTO_PAPER.** Builds a paper writer only when every secret is present, and can submit and cancel orders on the paper host. If secrets are missing, the cycle is refused and no order is sent. This is the mode `run-paper.cmd` and `run-paper.sh` call.
+- **AUTO_PAPER.** Builds a paper writer only when the selected profile's broker secrets are present, and can submit and cancel orders on the paper host. If those secrets are missing, the cycle is refused and no order is sent. On the main account this mode also refuses until the mechanics lifecycle gate has passed (see [Mechanics account](#mechanics-account)). `--account mechanics` is not gated. This is the mode `run-paper.cmd` and `run-paper.sh` call, on the main account.
 
 There is no live mode.
 
@@ -169,16 +200,17 @@ tests/                   Offline pytest suite and fixtures
 .github/workflows/tests.yml
 ```
 
-Runtime files are created locally and are gitignored: `data/journal.sqlite3` (and its WAL/SHM sidecars; the outbox is a table in this database), `data/desk.lock`, `data/desk.log`, `data/secrets.local.json`, `reports/`, and `logs/`.
+Runtime files are created locally and are gitignored: `data/journal.sqlite3` (and its WAL/SHM sidecars; the outbox is a table in this database), `data/desk.lock`, `data/desk.log`, `data/secrets.local.json`, `data/mechanics/` (mechanics journal, lock, and log), `reports/`, `reports/mechanics/`, `state/lifecycle_gate.json`, and `logs/`.
 
 ## Running tests
 
 The suite under `tests/` mocks the broker, the data feed, and GitHub. `tests/conftest.py` replaces socket connects so a test cannot open a network connection. No Alpaca or GitHub credentials are read.
 
+Create the virtual environment and install `requirements.txt` the same way as [Setup](#setup) if that is not done yet.
+
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\Activate.ps1
+py -m pytest
 ```
 
 `python desk.py self-test` runs that same suite. GitHub Actions (`.github/workflows/tests.yml`) runs it on `ubuntu-latest` with Python 3.11 for pushes and pull requests to `main`. The workflow has `contents: read` only, passes no secrets, and sets `PYTHON_KEYRING_BACKEND` to the null keyring so a headless runner does not probe the Secret Service.

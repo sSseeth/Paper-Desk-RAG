@@ -5,14 +5,13 @@ from datetime import date
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+from sakibdesk import account_profile as AP                    # noqa: E402
 from sakibdesk import secrets_store as SS                     # noqa: E402
 from sakibdesk.config import Config, ConfigError, PAPER_TRADING_HOST, DATA_HOST  # noqa: E402
 from sakibdesk.journal import Journal, iso                    # noqa: E402
 from sakibdesk.lock import ProcessLock, AlreadyRunning        # noqa: E402
+from sakibdesk import lifecycle_gate as LG                    # noqa: E402
 from sakibdesk import research as R, reports as RP, cycle as C  # noqa: E402
-
-DB = os.path.join(ROOT, "data", "journal.sqlite3")
-LOCK = os.path.join(ROOT, "data", "desk.lock")
 
 
 def _cfg():
@@ -26,20 +25,71 @@ def _secret(name):
     return SS.get(name, ROOT)
 
 
-def build_deps(cfg, mode):
-    """DRY_RUN never constructs a PaperWriter (no object that can POST/DELETE orders)."""
-    if SS.missing(ROOT):
+def build_deps(cfg, mode, account="main"):
+    """DRY_RUN never constructs a PaperWriter (no object that can POST/DELETE orders).
+
+    `main` still requires every historical secret before a client is built.
+    `mechanics` requires only its three broker secrets. Shared research and
+    webhook secrets are attached when they are present.
+    """
+    if account == "main":
+        if SS.missing(ROOT):
+            return C.Deps()
+    elif SS.missing_names(ROOT, SS.alpaca_keys(account)):
         return C.Deps()
     from sakibdesk.alpaca import PaperReader, PaperWriter, MarketData
-    kid, sec = _secret("ALPACA_PAPER_KEY_ID"), _secret("ALPACA_PAPER_SECRET")
+    key_id, secret_name, expected_name = SS.alpaca_keys(account)
+    kid, sec = _secret(key_id), _secret(secret_name)
     reader = PaperReader(kid, sec)
     writer = PaperWriter(kid, sec) if mode == "AUTO_PAPER" else None
     md = MarketData(kid, sec, cfg.feeds["stock_feed"], cfg.feeds["option_feed"])
-    rb = R.ResearchBridge(None, _secret("GITHUB_RESEARCH_REPO"), _secret("GITHUB_READONLY_TOKEN"))
-    return C.Deps(reader, writer, md, _secret("ALPACA_EXPECTED_ACCOUNT_ID"), rb)
+    repo, token = _secret("GITHUB_RESEARCH_REPO"), _secret("GITHUB_READONLY_TOKEN")
+    research = R.ResearchBridge(None, repo, token) if repo and token else None
+    return C.Deps(reader, writer, md, _secret(expected_name), research)
 
 
-def doctor(cfg, verbose=True, online=True):
+def _profiles_share_expected_id():
+    """True when the mechanics expected id and the main expected id are the same account."""
+    return AP.expected_ids_equal(
+        _secret_safe("ALPACA_EXPECTED_ACCOUNT_ID"),
+        _secret_safe("MECH_ALPACA_EXPECTED_ACCOUNT_ID"))
+
+
+def _alpaca_missing(account):
+    if account == "main":
+        return SS.missing(ROOT)
+    return SS.missing_names(ROOT, SS.alpaca_keys(account))
+
+
+def _account_mismatch(deps):
+    """True when the broker answered with a different account than this profile expects.
+
+    A read error returns False so the existing broker-error path still runs.
+    The raw id is not included in the refusal text.
+    """
+    if deps.reader is None:
+        return False
+    try:
+        acct = deps.reader.account()
+    except Exception:
+        return False
+    return not C.account_matches(acct, deps.expected_account_id)
+
+
+def _print_doctor_line(name, ok, detail):
+    if name == "lifecycle_gate":
+        # BLOCKED is informational. DRY_RUN stays available, so this line does not fail doctor.
+        state = "PASS" if detail == "PASS" else "BLOCKED"
+        if state == "PASS":
+            text = "stock_lifecycle and wheel_lifecycle recorded"
+        else:
+            text = "stock_lifecycle and wheel_lifecycle are not both recorded"
+        print(f"[{state}] {name}: {text}")
+        return
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
+
+
+def doctor(cfg, verbose=True, online=True, account="main"):
     checks = []
     checks.append(("config_valid", True, f"config_hash={cfg.config_hash} strategy={cfg.strategy_version}"))
     checks.append(("paper_host_hardcoded", PAPER_TRADING_HOST == "https://paper-api.alpaca.markets", PAPER_TRADING_HOST))
@@ -49,11 +99,18 @@ def doctor(cfg, verbose=True, online=True):
     ok, why, actual = R.schema_status(ROOT, cfg.policy)
     checks.append(("research_schema_signed", ok, f"{why}; file sha256={actual}; signed="
                                                  f"{cfg.policy['research']['signed_schema_sha256'] or '(empty)'}"))
-    miss = SS.missing(ROOT)
+    miss = _alpaca_missing(account)
     checks.append(("secrets_present", not miss, "missing: " + ", ".join(miss) if miss else "all present"))
-    if not miss and online:
+    share = _profiles_share_expected_id()
+    if share:
+        checks.append(("distinct_expected_accounts", False,
+                       "mechanics expected account id equals the main expected account id"))
+    if account == "main":
+        gate_ok, _gate_why = LG.gate_passed(ROOT)
+        checks.append(("lifecycle_gate", True, "PASS" if gate_ok else "BLOCKED"))
+    if not miss and online and not share:
         try:
-            deps = build_deps(cfg, "DRY_RUN")
+            deps = build_deps(cfg, "DRY_RUN", account)
             a = deps.reader.account()
             checks.append(("paper_account_id", C.account_matches(a, deps.expected_account_id),
                            f"account_number {a and a.get('account_number')} id {a and a.get('id')} "
@@ -67,23 +124,49 @@ def doctor(cfg, verbose=True, online=True):
     passed = all(c[1] for c in checks)
     if verbose:
         for n, o, d in checks:
-            print(f"[{'PASS' if o else 'FAIL'}] {n}: {d}")
+            _print_doctor_line(n, o, d)
         print("DOCTOR:", "PASS" if passed else "FAIL (new entries stay blocked; nothing was sent)")
     return passed, checks
 
 
-def cmd_cycle(cfg, mode):
-    log = SS.setup_logging(ROOT)
+def _refuse_same_account(j, mode):
+    """Journal and print a same-id refusal. Returns the process exit code."""
+    print("Refused: the mechanics expected account id equals the main expected account id. "
+          "Lifecycle checks require a separate paper account.")
+    kind = "AUTO_PAPER_REFUSED" if mode == "AUTO_PAPER" else "ACCOUNT_PROFILE_REFUSED"
+    j.event(kind, {"reason": "SAME_EXPECTED_ACCOUNT_ID"})
+    return 2
+
+
+def cmd_cycle(cfg, mode, account="main"):
+    log = SS.setup_logging(ROOT, account)
     try:
-        with ProcessLock(LOCK):
-            j = Journal(DB, cfg)
+        with ProcessLock(AP.lock_path(ROOT, account)):
+            j = Journal(AP.journal_path(ROOT, account), cfg)
+            # Fail closed before any writer exists. Mechanics is where the checks run, so it is not gated.
+            # DRY_RUN never consults the gate.
+            if mode == "AUTO_PAPER" and account == "main" and not LG.gate_passed(ROOT)[0]:
+                print("AUTO_PAPER refused: the mechanics lifecycle gate has not passed. "
+                      "Record stock_lifecycle and wheel_lifecycle with "
+                      "lifecycle-record --account mechanics before AUTO_PAPER on main. "
+                      "reason=LIFECYCLE_GATE_NOT_PASSED")
+                j.event("AUTO_PAPER_REFUSED", {"reason": "LIFECYCLE_GATE_NOT_PASSED"})
+                return 2
+            if _profiles_share_expected_id():
+                return _refuse_same_account(j, mode)
             start_hash = cfg.config_hash
-            j.set("active_run", {"run_id": j.run_id, "config_hash": start_hash})
-            deps = build_deps(cfg, mode)
-            if mode == "AUTO_PAPER" and deps.writer is None:
+            # Read-only client first, so a mismatch never constructs a writer.
+            read_deps = build_deps(cfg, "DRY_RUN", account)
+            if mode == "AUTO_PAPER" and read_deps.reader is None:
                 print("AUTO_PAPER refused: secrets missing; no orders possible.")
                 j.event("AUTO_PAPER_REFUSED", {"reason": "secrets missing"})
                 return 2
+            if _account_mismatch(read_deps):
+                print("Refused: the broker account does not match the selected profile's expected account id.")
+                j.event("ACCOUNT_MISMATCH", {"reason": "SELECTED_PROFILE_MISMATCH"})
+                return 2
+            j.set("active_run", {"run_id": j.run_id, "config_hash": start_hash})
+            deps = read_deps if mode == "DRY_RUN" else build_deps(cfg, "AUTO_PAPER", account)
             if deps.research:
                 deps.research.j = j; deps.research.clock = j.clock
             summary = C.run_cycle(cfg, j, mode, deps, ROOT)
@@ -92,13 +175,13 @@ def cmd_cycle(cfg, mode):
                 summary["entry_blocks"].append("POLICY_CHANGED_DURING_RUN")
             summary["stamp"] = RP.stamp(cfg)
             label = date.today().isoformat()
-            h, c = RP.write_local(ROOT, cfg, j, summary, label)
+            h, c = RP.write_local(ROOT, cfg, j, summary, label, directory=AP.reports_dir(ROOT, account))
             eid = f"HB-{j.run_id}"
             RP.enqueue(j, eid, {"type": "cycle_summary", "event_id": eid, **summary})
             RP.deliver(j, _secret_safe("GROK_WEBHOOK_URL"), _secret_safe("GROK_WEBHOOK_BEARER"))
             j.set("heartbeat", iso(j.clock()))
             j.set("active_run", None)
-            log.info("cycle %s done blocks=%s", mode, summary["entry_blocks"])
+            log.info("cycle %s account=%s done blocks=%s", mode, account, summary["entry_blocks"])
             print(json.dumps(summary, indent=2, default=str))
             print(f"Local reports: {h} , {c}")
             return 0
@@ -114,11 +197,12 @@ def _secret_safe(n):
         return None
 
 
-def cmd_report(cfg):
-    j = Journal(DB, cfg)
+def cmd_report(cfg, account="main"):
+    j = Journal(AP.journal_path(ROOT, account), cfg)
     summary = {"type": "report", "events": len(j.events()), "stamp": RP.stamp(cfg),
                "outbox_pending": j.db.execute("SELECT COUNT(*) n FROM outbox WHERE status='PENDING'").fetchone()["n"]}
-    h, c = RP.write_local(ROOT, cfg, j, summary, "manual-" + date.today().isoformat())
+    h, c = RP.write_local(ROOT, cfg, j, summary, "manual-" + date.today().isoformat(),
+                          directory=AP.reports_dir(ROOT, account))
     eid = f"RPT-{uuid.uuid4().hex[:12]}"
     RP.enqueue(j, eid, summary)
     print(RP.deliver(j, _secret_safe("GROK_WEBHOOK_URL"), _secret_safe("GROK_WEBHOOK_BEARER")))
@@ -296,16 +380,30 @@ def _assigned_lots_and_coverage(j, raw_pos, option_positions):
     return lots, coverage, flags
 
 
-def cmd_snapshot(cfg):
-    miss = SS.missing(ROOT)
+def cmd_snapshot(cfg, account="main"):
+    miss = _alpaca_missing(account)
     if miss:
         print("SNAPSHOT refused: secrets missing: " + ", ".join(miss)); return 2
+    if _profiles_share_expected_id():
+        print("SNAPSHOT refused: the mechanics expected account id equals the main expected account id.")
+        return 2
     from sakibdesk.alpaca import PaperReader
-    j = Journal(DB, cfg)
-    snap = build_snapshot(cfg, j, PaperReader(_secret("ALPACA_PAPER_KEY_ID"), _secret("ALPACA_PAPER_SECRET")),
-                          _secret("ALPACA_EXPECTED_ACCOUNT_ID"), iso(j.clock()))
-    os.makedirs(os.path.join(ROOT, "reports"), exist_ok=True)
-    out = os.path.join(ROOT, "reports", f"snapshot_{date.today().isoformat()}.json")
+    key_id, secret_name, expected_name = SS.alpaca_keys(account)
+    reader = PaperReader(_secret(key_id), _secret(secret_name))
+    expected = _secret(expected_name)
+    try:
+        acct = reader.account()
+    except Exception as e:
+        print("SNAPSHOT refused: " + SS.redact(str(e)))
+        return 2
+    if not C.account_matches(acct, expected):
+        print("SNAPSHOT refused: the broker account does not match the selected profile's expected account id.")
+        return 2
+    j = Journal(AP.journal_path(ROOT, account), cfg)
+    snap = build_snapshot(cfg, j, reader, expected, iso(j.clock()))
+    out_dir = AP.reports_dir(ROOT, account)
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"snapshot_{date.today().isoformat()}.json")
     with open(out, "w") as fh:
         json.dump(snap, fh, indent=2, default=str)
     print(SS.redact(json.dumps(snap, indent=2, default=str)))
@@ -364,14 +462,15 @@ def print_research_check(res):
     print("Nothing was traded and nothing was written to GitHub.")
 
 
-def cmd_research_check(cfg):
+def cmd_research_check(cfg, account="main"):
     from sakibdesk.journal import utcnow
     miss = [k for k in ("GITHUB_RESEARCH_REPO", "GITHUB_READONLY_TOKEN") if not _secret_safe(k)]
     if miss:
         print("RESEARCH-CHECK refused: secrets missing: " + ", ".join(miss)); return 2
     res = run_research_check(cfg, _secret("GITHUB_RESEARCH_REPO"), _secret("GITHUB_READONLY_TOKEN"), utcnow())
-    os.makedirs(os.path.join(ROOT, "reports"), exist_ok=True)
-    out = os.path.join(ROOT, "reports", f"research_check_{date.today().isoformat()}.json")
+    out_dir = AP.reports_dir(ROOT, account)
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, f"research_check_{date.today().isoformat()}.json")
     with open(out, "w") as fh:
         fh.write(SS.redact(json.dumps(res, indent=2, default=str)))
     print(SS.redact(_capture(print_research_check, res)))
@@ -389,11 +488,18 @@ def _capture(fn, *a):
     return buf.getvalue().rstrip("\n")
 
 
-def cmd_pause(cfg):
-    j = Journal(DB, cfg)
+def cmd_pause(cfg, account="main"):
+    if _profiles_share_expected_id():
+        print("PAUSE refused: the mechanics expected account id equals the main expected account id.")
+        return 2
+    read_deps = build_deps(cfg, "DRY_RUN", account)
+    if _account_mismatch(read_deps):
+        print("PAUSE refused: the broker account does not match the selected profile's expected account id.")
+        return 2
+    deps = build_deps(cfg, "AUTO_PAPER", account)
+    j = Journal(AP.journal_path(ROOT, account), cfg)
     j.set("paused", True)
     j.event("PAUSED", {"note": "no new entries; exits and reconciliation continue"})
-    deps = build_deps(cfg, "AUTO_PAPER")
     summary = {"actions": []}
     if deps.writer:
         from sakibdesk.orders import OrderManager
@@ -404,12 +510,12 @@ def cmd_pause(cfg):
     return 0
 
 
-def _doctor_ok(cfg):
-    return doctor(cfg)[0]
+def _doctor_ok(cfg, account="main"):
+    return doctor(cfg, account=account)[0]
 
 
-def resume_allowed(j, cfg):
-    if not _doctor_ok(cfg):
+def resume_allowed(j, cfg, account="main"):
+    if not _doctor_ok(cfg, account):
         return False, "RESUME REFUSED: doctor failed."
     if j.get("experiment_block"):
         return False, "RESUME REFUSED: experiment drawdown block (10%) cannot be bypassed."
@@ -418,26 +524,39 @@ def resume_allowed(j, cfg):
     return True, "ok"
 
 
-def cmd_resume(cfg):
-    j = Journal(DB, cfg)
-    ok, why = resume_allowed(j, cfg)
+def cmd_resume(cfg, account="main"):
+    if _profiles_share_expected_id():
+        print("RESUME refused: the mechanics expected account id equals the main expected account id.")
+        return 2
+    j = Journal(AP.journal_path(ROOT, account), cfg)
+    ok, why = resume_allowed(j, cfg, account)
     if not ok:
         print(why); return 2
     j.set("paused", False); j.event("RESUMED", {})
     print("RESUMED (daily loss block, if any, still applies today)."); return 0
 
 
-def cmd_flatten(cfg):
+def cmd_flatten(cfg, account="main"):
     """Cancel/reconcile pending orders; buy back short calls BEFORE selling covering shares; close puts; then
     sell long shares at fresh quotes. Reports unresolved orders; never claims completion without fills."""
-    deps = build_deps(cfg, "AUTO_PAPER")
+    if _profiles_share_expected_id():
+        print("FLATTEN refused: the mechanics expected account id equals the main expected account id. Nothing sent.")
+        return 2
+    read_deps = build_deps(cfg, "DRY_RUN", account)
+    if read_deps.reader is None:
+        print("FLATTEN NOT POSSIBLE: no broker credentials. Nothing sent."); return 2
+    if _account_mismatch(read_deps):
+        print("FLATTEN refused: the broker account does not match the selected profile's expected account id. "
+              "Nothing sent.")
+        return 2
+    deps = build_deps(cfg, "AUTO_PAPER", account)
     if not deps.writer:
         print("FLATTEN NOT POSSIBLE: no broker credentials. Nothing sent."); return 2
     from sakibdesk.orders import OrderManager
     from sakibdesk import wheel as W, stock as S
     from sakibdesk.ledger import Ledger
-    with ProcessLock(LOCK):
-        j = Journal(DB, cfg)
+    with ProcessLock(AP.lock_path(ROOT, account)):
+        j = Journal(AP.journal_path(ROOT, account), cfg)
         j.set("paused", True)
         om = OrderManager(j, cfg, deps.writer, ledger=Ledger(j, cfg.policy))
         unresolved = []
@@ -481,6 +600,32 @@ def cmd_flatten(cfg):
     return 0
 
 
+def cmd_lifecycle_record(cfg, account, check, evidence):
+    """Record one mechanics lifecycle check after read-only broker checks pass.
+
+    Refuses `--account main`. Does not submit or cancel orders. The gate file
+    receives a sha256 prefix of the expected account id, never the raw id.
+    """
+    if account != "mechanics":
+        print("lifecycle-record refused: this command only runs with --account mechanics. "
+              "The main account cannot record its own lifecycle gate.")
+        return 2
+    if _profiles_share_expected_id():
+        print("lifecycle-record refused: the mechanics expected account id equals the main expected account id.")
+        return 2
+    passed, _checks = doctor(cfg, verbose=True, online=True, account="mechanics")
+    if not passed:
+        print("lifecycle-record refused: mechanics read-only checks did not pass. Nothing was recorded.")
+        return 2
+    expected = _secret("MECH_ALPACA_EXPECTED_ACCOUNT_ID")
+    ok, msg = LG.record_check(ROOT, check, expected, cfg.config_hash, evidence)
+    if not ok:
+        print(f"lifecycle-record refused: {msg}")
+        return 2
+    print(f"Recorded {msg}. Gate file: {LG.gate_path(ROOT)}. The raw account id was not written.")
+    return 0
+
+
 def cmd_self_test():
     cfg = _cfg()
     print(f"Config OK: {cfg.strategy_version} hash={cfg.config_hash} profile={cfg.feed_profile}")
@@ -495,22 +640,34 @@ def cmd_self_test():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="desk.py", description="sSseethPaperDesk (Alpaca PAPER only)")
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--account", choices=AP.PROFILES, default="main",
+                        help="Paper account profile (default: main). mechanics is the separate lifecycle account.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("setup-secrets", "doctor", "self-test", "report", "snapshot", "research-check", "pause", "resume", "flatten"):
-        sub.add_parser(c)
-    cy = sub.add_parser("cycle")
+        sub.add_parser(c, parents=[parent])
+    cy = sub.add_parser("cycle", parents=[parent])
     cy.add_argument("--mode", required=True, choices=["DRY_RUN", "AUTO_PAPER"])
+    lr = sub.add_parser("lifecycle-record", parents=[parent])
+    lr.add_argument("--check", required=True, choices=sorted(LG.CLI_CHECKS),
+                    help="stock or wheel. Stored as stock_lifecycle or wheel_lifecycle.")
+    lr.add_argument("--evidence", required=True,
+                    help="Short note of what was observed. Do not include the account id.")
     a = ap.parse_args(argv)
+    account = a.account
     if a.cmd == "setup-secrets":
-        SS.setup_interactive(ROOT); return 0
+        SS.setup_interactive(ROOT, account); return 0
     if a.cmd == "self-test":
         return cmd_self_test()
     cfg = _cfg()
     if a.cmd == "doctor":
-        return 0 if doctor(cfg)[0] else 2
+        return 0 if doctor(cfg, account=account)[0] else 2
     if a.cmd == "cycle":
-        return cmd_cycle(cfg, a.mode)
-    return {"report": cmd_report, "snapshot": cmd_snapshot, "research-check": cmd_research_check, "pause": cmd_pause, "resume": cmd_resume, "flatten": cmd_flatten}[a.cmd](cfg)
+        return cmd_cycle(cfg, a.mode, account)
+    if a.cmd == "lifecycle-record":
+        return cmd_lifecycle_record(cfg, account, a.check, a.evidence)
+    return {"report": cmd_report, "snapshot": cmd_snapshot, "research-check": cmd_research_check,
+            "pause": cmd_pause, "resume": cmd_resume, "flatten": cmd_flatten}[a.cmd](cfg, account)
 
 
 if __name__ == "__main__":

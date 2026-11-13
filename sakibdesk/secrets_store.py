@@ -1,12 +1,34 @@
 """Secrets: OS keyring first, else a protected local file (0600 / user-only ACL). Never args, source or logs."""
 import getpass, json, logging, os, re, stat, sys
+from .account_profile import log_path
 
 SERVICE = "SakibPaperDesk"
-KEYS = ("ALPACA_PAPER_KEY_ID", "ALPACA_PAPER_SECRET", "ALPACA_EXPECTED_ACCOUNT_ID",
-        "GITHUB_READONLY_TOKEN", "GITHUB_RESEARCH_REPO", "GROK_WEBHOOK_URL", "GROK_WEBHOOK_BEARER")
+# Main Alpaca names are stable. Existing credential-manager entries must keep working.
+MAIN_ALPACA_KEYS = ("ALPACA_PAPER_KEY_ID", "ALPACA_PAPER_SECRET", "ALPACA_EXPECTED_ACCOUNT_ID")
+MECH_ALPACA_KEYS = ("MECH_ALPACA_PAPER_KEY_ID", "MECH_ALPACA_PAPER_SECRET", "MECH_ALPACA_EXPECTED_ACCOUNT_ID")
+KEYS = MAIN_ALPACA_KEYS + ("GITHUB_READONLY_TOKEN", "GITHUB_RESEARCH_REPO", "GROK_WEBHOOK_URL", "GROK_WEBHOOK_BEARER")
 SECRET_KEYS = ("ALPACA_PAPER_KEY_ID", "ALPACA_PAPER_SECRET", "GITHUB_READONLY_TOKEN", "GROK_WEBHOOK_BEARER",
-               "GROK_WEBHOOK_URL")
+               "GROK_WEBHOOK_URL", "MECH_ALPACA_PAPER_KEY_ID", "MECH_ALPACA_PAPER_SECRET")
 _known_values = set()
+_PROFILES = ("main", "mechanics")
+
+
+def alpaca_keys(account):
+    """Broker secret names for this profile. Main names are the historical ones."""
+    if account == "main":
+        return MAIN_ALPACA_KEYS
+    if account == "mechanics":
+        return MECH_ALPACA_KEYS
+    raise ValueError(f"unknown account profile: {account}")
+
+
+def profile_keys(account):
+    """Names setup and doctor require. Mechanics is only the three broker secrets."""
+    if account == "main":
+        return KEYS
+    if account == "mechanics":
+        return MECH_ALPACA_KEYS
+    raise ValueError(f"unknown account profile: {account}")
 
 
 def _file_path(root):
@@ -44,9 +66,9 @@ def get(name, root):
     return v
 
 
-def missing(root):
+def missing_names(root, names):
     out = []
-    for k in KEYS:
+    for k in names:
         try:
             if not get(k, root):
                 out.append(k)
@@ -55,12 +77,29 @@ def missing(root):
     return out
 
 
-def setup_interactive(root):
+def missing(root):
+    """Main-profile names. Callers pass only `root`; that signature stays."""
+    return missing_names(root, KEYS)
+
+
+def setup_interactive(root, account="main"):
+    if account not in _PROFILES:
+        raise ValueError(f"unknown account profile: {account}")
     kr = _kr()
     store = {}
+    names = profile_keys(account)
+    # Mechanics prompts are all hidden. Main still shows the expected-account prompt.
+    hidden = set(names) if account == "mechanics" else set(SECRET_KEYS)
+    if account == "mechanics":
+        print("Mechanics paper account. Every prompt is hidden and is not echoed.")
     print("Secrets are typed into hidden prompts; leave blank to keep existing value.")
-    for k in KEYS:
-        v = getpass.getpass(f"{k}: ") if k in SECRET_KEYS else input(f"{k}: ").strip()
+    for k in names:
+        if k in hidden:
+            v = getpass.getpass(f"{k}: ")
+            if k.endswith("EXPECTED_ACCOUNT_ID"):
+                v = v.strip()
+        else:
+            v = input(f"{k}: ").strip()
         if not v:
             continue
         if kr:
@@ -103,13 +142,15 @@ class RedactingFilter(logging.Filter):
         return True
 
 
-def setup_logging(root):
-    os.makedirs(os.path.join(root, "data"), exist_ok=True)
-    log = logging.getLogger("spd")
+def setup_logging(root, account="main"):
+    path = log_path(root, account)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    log = logging.getLogger("spd." + account)
     if not log.handlers:
-        h = logging.FileHandler(os.path.join(root, "data", "desk.log"), encoding="utf-8")
+        h = logging.FileHandler(path, encoding="utf-8")
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         h.addFilter(RedactingFilter())
         log.addHandler(h)
         log.setLevel(logging.INFO)
+        log.propagate = False
     return log
