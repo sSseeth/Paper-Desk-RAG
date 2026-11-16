@@ -185,6 +185,69 @@ def tick_round_up(px):
     return round(math.ceil(px / t - 1e-9) * t, 2)
 
 
+def option_order_body(symbol, side, limit, intent, qty=1):
+    """Limit option order the wheel book submits. `limit` is already tick-rounded."""
+    return {"symbol": symbol, "qty": str(int(qty)), "side": side, "type": "limit",
+            "time_in_force": "day", "limit_price": f"{float(limit):.2f}",
+            "position_intent": intent}
+
+
+def mock_paths_pass():
+    """In-process wheel state paths. These prove the code, not a broker fill.
+
+    Main-account wheel entries stay blocked when this returns False. A paper
+    assignment is a separate, observed check.
+    """
+    try:
+        seq = ["PUT_SUBMITTED", "PUT_FILLED", "ASSIGNMENT_CONFIRMED", "CALL_SUBMITTED", "CALL_FILLED",
+               "BUYBACK_SUBMITTED", "BUYBACK_FILLED", "CALL_SUBMITTED", "CALL_FILLED", "ASSIGNMENT_CONFIRMED"]
+        state, path = "CASH", ["CASH"]
+        for event in seq:
+            state = transition(state, event)
+            path.append(state)
+        if path[-1] != "CLOSED":
+            return False, "assignment sequence did not close"
+        try:
+            transition("CASH", "CALL_SUBMITTED")
+        except InvalidTransition:
+            pass
+        else:
+            return False, "invalid transition was accepted"
+        if classify_option_outcome("X", True, [], []) != "OPTION_POSITION_GONE_UNEXPLAINED":
+            return False, "assignment inferred without a broker activity"
+        opasn = [{"symbol": "X", "activity_type": "OPASN"}]
+        if classify_option_outcome("X", True, [], opasn) != "ASSIGNMENT_CONFIRMED":
+            return False, "OPASN was not treated as assignment"
+        opexp = [{"symbol": "X", "activity_type": "OPEXP"}]
+        if classify_option_outcome("X", True, [], opexp) != "EXPIRED_CONFIRMED":
+            return False, "OPEXP was not treated as expiry"
+        state = "CASH"
+        for event in ("PUT_SUBMITTED", "PUT_FILLED", "BUYBACK_SUBMITTED", "BUYBACK_FILLED"):
+            state = transition(state, event)
+        if state != "CLOSED":
+            return False, "buyback did not close the put"
+        state = "CASH"
+        for event in ("PUT_SUBMITTED", "PUT_FILLED", "EXPIRED_CONFIRMED"):
+            state = transition(state, event)
+        if state != "CLOSED":
+            return False, "put expiry did not close"
+        state = "CASH"
+        for event in ("PUT_SUBMITTED", "PUT_FILLED", "ASSIGNMENT_CONFIRMED", "CALL_SUBMITTED",
+                      "CALL_FILLED", "EXPIRED_CONFIRMED"):
+            state = transition(state, event)
+        if state != "SHARES_HELD":
+            return False, "call expiry did not return shares"
+        state = "CASH"
+        for event in ("PUT_SUBMITTED", "PUT_FILLED", "ASSIGNMENT_CONFIRMED", "CALL_SUBMITTED",
+                      "CALL_FILLED", "ASSIGNMENT_CONFIRMED"):
+            state = transition(state, event)
+        if state != "CLOSED":
+            return False, "call delivery did not close"
+    except (InvalidTransition, KeyError, TypeError, ValueError) as exc:
+        return False, f"mock wheel paths failed: {type(exc).__name__}"
+    return True, "mock wheel state paths pass"
+
+
 def management_actions(cycle, *, now_session_date, calendar, stock_mid, opt_bid, opt_ask, earnings_earliest,
                        dividend, distress, p, closing_session_preceding_exdiv=False):
     """Return list of (action, reason) for an active cycle. Risk-reducing only."""

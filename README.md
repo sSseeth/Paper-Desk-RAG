@@ -102,17 +102,56 @@ py desk.py doctor --account mechanics
 
 Mechanics orders, the journal, and reports stay apart from the main book: `data/mechanics/journal.sqlite3` and `reports/mechanics/`. The main journal stays `data/journal.sqlite3` and main reports stay in `reports/`. The paper host stays `https://paper-api.alpaca.markets`. There is no live endpoint.
 
-After the checks have been observed on the mechanics account, record them. This command refuses `--account main`. It reads the mechanics account and does not submit or cancel orders. Do not put the account id in `--evidence`.
+After a mechanics suite passes, record the check it proved. `lifecycle-record` refuses `--account main`. It reads the mechanics account and does not submit or cancel orders. Do not put the account id in `--evidence`. `wheel` is accepted only when the evidence contains `OBSERVED_PAPER_ASSIGNMENT` and does not contain `MOCK`.
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-py desk.py lifecycle-record --account mechanics --check stock --evidence "stock bracket lifecycle observed"
-py desk.py lifecycle-record --account mechanics --check wheel --evidence "wheel lifecycle observed"
+py desk.py lifecycle-record --account mechanics --check stock --evidence "stock lifecycle run <run-id>"
+py desk.py lifecycle-record --account mechanics --check wheel-sell-buyback --evidence "wheel sell and buyback run <run-id>"
+py desk.py lifecycle-record --account mechanics --check wheel --evidence "OBSERVED_PAPER_ASSIGNMENT run <run-id>"
 ```
 
-The record is `state/lifecycle_gate.json` (gitignored). Each of `stock_lifecycle` and `wheel_lifecycle` stores the UTC time, a 16-character sha256 prefix of the mechanics expected account id, the runner git commit, the config hash, and the evidence note. The raw account id is not written. A missing or corrupt file is not a pass.
+The record is `state/lifecycle_gate.json` (gitignored). `stock_lifecycle`, `wheel_sell_buyback`, and `wheel_lifecycle` each store the UTC time, a 16-character sha256 prefix of the mechanics expected account id, the runner git commit, the config hash, and the evidence note. The raw account id is not written. A missing or corrupt file is not a pass.
 
-`cycle --mode AUTO_PAPER` on the main account (the default, including `run-paper.cmd` and `run-paper.sh`) refuses with journal event `AUTO_PAPER_REFUSED` and reason `LIFECYCLE_GATE_NOT_PASSED` until both checks are recorded. `cycle --mode AUTO_PAPER --account mechanics` is not gated, so the checks themselves run there. `DRY_RUN` is never gated. `doctor` on main prints `lifecycle_gate` as `PASS` or `BLOCKED`. `BLOCKED` does not fail doctor.
+`cycle --mode AUTO_PAPER` on the main account (the default, including `run-paper.cmd` and `run-paper.sh`) refuses with journal event `AUTO_PAPER_REFUSED` and reason `LIFECYCLE_GATE_NOT_PASSED` until `stock_lifecycle` is recorded. With that check recorded, the stock book may enter. Wheel entries stay blocked until `wheel_sell_buyback` is recorded and the mock wheel state paths pass. Until `wheel_lifecycle` is recorded from an observed paper assignment, those wheel entries are labelled `PROVISIONAL` on the journal, the report, and `doctor`. Do not call that book fully verified. `cycle --mode AUTO_PAPER --account mechanics` is not gated. `DRY_RUN` is never gated. `doctor` on main prints each check. `BLOCKED` and `PROVISIONAL` do not by themselves fail doctor. A missing or corrupt gate file still refuses main `AUTO_PAPER`.
+
+## Mechanics lifecycle tests
+
+These commands trade only on the mechanics paper account. `--account main` is refused before a client is built. They use `F` (Ford), a liquid name that is usually inside $5–$30, from mechanics-only settings. They do not change `policy.json`, the config hash, or the main journal. Mechanics fills are not part of the main performance or SPY benchmark series.
+
+The stock round trip buys 1 share. A partial-fill probe rests 2 shares. The suite refuses an ask outside $5–$30 and any order above a $60 notional cap. The wheel suites sell 1 contract. The strike is at most $30, and `strike * 100` plus the $3 reserve allowance must fit mechanics cash, so collateral is at most $3,003 and never more than the cash in that account.
+
+Run them only while the Alpaca clock says the regular US session is open (09:30–16:00 America/New_York). In Australia/Sydney that is currently 1:30 AM–8:00 AM AEDT. Outside that window the command refuses and sends nothing. `wheel-expiry --reconcile` may be run later in the day to read assignment activity; selling the covered call still waits for the regular session.
+
+The stock suite refuses if `F` already has a position or an open order, so it will not sell shares held for the expiry track.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py mechanics-test --account mechanics --suite stock --record
+```
+
+On PASS, `--record` writes `stock_lifecycle`. Without `--record` the same command prints the `lifecycle-record` line, including the mechanics journal run id. The evidence says whether partial-fill protection was `BROKER` or `MOCK`. A far limit that never partial-fills is still a pass when the runner's reservation and duplicate-order checks pass on a scratch book, and that part is marked `MOCK`.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py mechanics-test --account mechanics --suite wheel-sell-buyback
+```
+
+This sells one far-OTM put on the nearest weekly with at least 1 day to expiry, buys it back, and on PASS records `wheel_sell_buyback`.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py mechanics-test --account mechanics --suite wheel-expiry --start
+```
+
+This sells one near-expiry, slightly in-the-money put and stores the intent in the mechanics journal. It does not record `wheel_lifecycle`.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py mechanics-test --account mechanics --suite wheel-expiry --reconcile
+```
+
+Run that on later days. It reads broker activities. An option that disappears without `OPASN`, `OPXRC`, or `OPEXP` is `MOCK` and does not record `wheel_lifecycle`. An `OPASN` or `OPXRC` assignment is `OBSERVED_PAPER_ASSIGNMENT`: the run checks that 100 shares are reserved, sells a covered call, and a later reconcile records `wheel_lifecycle` only after that call's delivery or expiry is observed. A mock transition is not full verification.
 
 ## Commands
 
@@ -121,7 +160,7 @@ Run them as `py desk.py <command>` from the repository root. On Windows, every P
 | Command | What it does |
 | --- | --- |
 | `setup-secrets` | Prompt for the main seven secrets, or with `--account mechanics` the three `MECH_ALPACA_*` secrets, and store them in the OS keyring. |
-| `doctor` | Check the config hash, hard-coded paper host, feed profile, pinned schema hash, and that profile's secrets. When those secrets are present, also read the paper account, clock, and a SPY quote. On main, also prints `lifecycle_gate` `PASS` or `BLOCKED` (BLOCKED does not fail doctor). Exit 0 when every check passes, 2 otherwise. Nothing is sent. |
+| `doctor` | Check the config hash, hard-coded paper host, feed profile, pinned schema hash, and that profile's secrets. When those secrets are present, also read the paper account, clock, and a SPY quote. On main, prints each lifecycle check (`RECORDED`, `NOT_RECORDED`, `PROVISIONAL`, or `INVALID`) plus `lifecycle_gate` (`PASS`, `BLOCKED`, or `CORRUPT`). `BLOCKED` and `PROVISIONAL` do not fail doctor. A failed mock wheel path does. Exit 0 when the checks pass, 2 otherwise. Nothing is sent. |
 | `self-test` | Print the config and schema status, then run the offline pytest suite. The exit code is pytest's. |
 | `report` | Write the local HTML and CSV reports from that profile's journal and try to deliver pending outbox events. Does not trade. |
 | `snapshot` | Read-only account, ledger, position, open-order, and covered-call snapshot. Refuses if that profile's broker secrets are missing, if the two expected account ids match, or if the broker account does not match. Saves `reports/snapshot_<date>.json` (mechanics: `reports/mechanics/`). Never constructs an order writer. |
@@ -129,8 +168,9 @@ Run them as `py desk.py <command>` from the repository root. On Windows, every P
 | `pause` | Block new entries. Later cycles still reconcile and manage exits. Cancels pending entry orders when paper credentials can build a writer. Refuses if the selected broker account does not match. |
 | `resume` | Clear the pause only when `doctor` passes, the experiment drawdown block is off, and three consecutive healthy reconciliations are on record. A daily loss block for the current session still applies. |
 | `flatten` | Pause and work the selected paper book toward flat: confirm cancels, buy back short calls before short puts, and sell long shares only once no short calls remain. Refuses without credentials or on an account mismatch. Does not claim completion until fills reconcile. |
-| `lifecycle-record --check stock\|wheel --evidence "..."` | Mechanics only. After read-only checks pass, record that lifecycle check in `state/lifecycle_gate.json`. Refuses `--account main`. |
-| `cycle --mode DRY_RUN\|AUTO_PAPER` | Run one cycle under a process lock. `--mode` is required. Main `AUTO_PAPER` also requires the lifecycle gate. |
+| `lifecycle-record --check stock\|wheel-sell-buyback\|wheel --evidence "..."` | Mechanics only. After read-only checks pass, record that check in `state/lifecycle_gate.json`. `wheel` requires `OBSERVED_PAPER_ASSIGNMENT` and rejects `MOCK`. Refuses `--account main`. |
+| `mechanics-test --suite stock\|wheel-sell-buyback\|wheel-expiry` | Mechanics only. Broker-verified lifecycle steps on `F`, journaled separately from the main book. See [Mechanics lifecycle tests](#mechanics-lifecycle-tests). |
+| `cycle --mode DRY_RUN\|AUTO_PAPER` | Run one cycle under a process lock. `--mode` is required. Main `AUTO_PAPER` requires `stock_lifecycle`. Wheel entries also require `wheel_sell_buyback` and the mock wheel paths, and stay `PROVISIONAL` until `wheel_lifecycle`. |
 
 If `data/desk.lock` is already held, `cycle` prints a message and exits 0 without sending orders. `flatten` takes the same lock after the credential check and does not catch a busy lock, so a second flatten fails instead of sending another batch.
 
@@ -139,7 +179,7 @@ If `data/desk.lock` is already held, `cycle` prints a message and exits 0 withou
 `cycle` has two modes and no default. You pass one.
 
 - **DRY_RUN.** No `PaperWriter` is constructed, so the process has no object that can submit or cancel an order. Intents that would have been sent are recorded with status `DRY_RUN` and nothing goes to the broker. Use this while checking secrets, research, and the log.
-- **AUTO_PAPER.** Builds a paper writer only when the selected profile's broker secrets are present, and can submit and cancel orders on the paper host. If those secrets are missing, the cycle is refused and no order is sent. On the main account this mode also refuses until the mechanics lifecycle gate has passed (see [Mechanics account](#mechanics-account)). `--account mechanics` is not gated. This is the mode `run-paper.cmd` and `run-paper.sh` call, on the main account.
+- **AUTO_PAPER.** Builds a paper writer only when the selected profile's broker secrets are present, and can submit and cancel orders on the paper host. If those secrets are missing, the cycle is refused and no order is sent. On the main account this mode also refuses until `stock_lifecycle` is recorded (see [Mechanics account](#mechanics-account)). Wheel entries then wait for `wheel_sell_buyback` and the mock wheel paths, and are `PROVISIONAL` until `wheel_lifecycle`. `--account mechanics` is not gated. This is the mode `run-paper.cmd` and `run-paper.sh` call, on the main account.
 
 There is no live mode.
 
@@ -220,7 +260,7 @@ py -m pytest
 This is a work in progress. The pieces below are implemented and covered by offline tests. They have not been observed against a live paper session in this repository.
 
 - New entries stay blocked until a research repository supplies records that pass the pinned gate. The bridge client itself is not pre-connected to any repository.
-- Stock and wheel order lifecycles, assignment handling, and accounting are mock-tested. They are not reconciled here against a real paper account.
+- `mechanics-test` can verify stock orders, a wheel sell/buyback, and a multi-day assignment on the mechanics paper account. Until those runs are recorded, stock and wheel order lifecycles in this repository are mock-tested only. A mock assignment is not full verification. Mechanics results stay out of the main performance series.
 - Webhook delivery is mock-tested. You still have to supply the URL and bearer, and to install Task Scheduler or cron yourself.
 - `flatten` can take more than one run: short calls are bought back before the shares that cover them are sold, and the command does not report the book flat until those fills reconcile.
 - The process lock is local to one machine. It does not stop a second computer.

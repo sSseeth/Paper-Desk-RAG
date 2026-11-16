@@ -49,7 +49,7 @@ def _write_check(root, name):
         "mechanics_account_id_sha256_prefix": PREFIX,
         "runner_git_commit": "UNKNOWN",
         "config_hash": "2df03f83726ac139",
-        "evidence": "observed",
+        "evidence": ("OBSERVED_PAPER_ASSIGNMENT observed" if name == "wheel_lifecycle" else "observed"),
     }
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(data, handle)
@@ -69,8 +69,9 @@ def _install_cycle(monkeypatch, account_id, calls):
         writer = object() if mode == "AUTO_PAPER" else None
         return C.Deps(reader=_Reader(account_id), writer=writer, expected_account_id=account_id)
 
-    def run(cfg, journal, mode, deps, root):
+    def run(cfg, journal, mode, deps, root, entry_policy=None):
         calls["ran"] = (mode, deps.writer is not None)
+        calls["policy"] = entry_policy
         return {"entry_blocks": [], "actions": [], "orders": []}
 
     monkeypatch.setattr(desk, "build_deps", build)
@@ -170,11 +171,12 @@ def test_broker_account_mismatch_refuses(monkeypatch, tmp_path, capsys):
     assert _payloads(root, "main", "ACCOUNT_MISMATCH") == [{"reason": "SELECTED_PROFILE_MISMATCH"}]
 
 
-@pytest.mark.parametrize("kind", ["missing", "partial", "corrupt"])
-def test_auto_paper_main_refused_until_both_checks(monkeypatch, tmp_path, capsys, kind):
+@pytest.mark.parametrize("kind", ["missing", "corrupt", "wheel_only"])
+def test_auto_paper_main_refused_without_stock_lifecycle(monkeypatch, tmp_path, capsys, kind):
     root, cfg = _root(monkeypatch, tmp_path)
-    if kind == "partial":
-        _write_check(root, "stock_lifecycle")
+    if kind == "wheel_only":
+        _write_check(root, "wheel_lifecycle")
+        _write_check(root, "wheel_sell_buyback")
     elif kind == "corrupt":
         path = LG.gate_path(root)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -188,18 +190,38 @@ def test_auto_paper_main_refused_until_both_checks(monkeypatch, tmp_path, capsys
     assert _payloads(root, "main", "AUTO_PAPER_REFUSED") == [{"reason": "LIFECYCLE_GATE_NOT_PASSED"}]
 
 
-def test_auto_paper_main_allowed_when_both_checks_recorded(monkeypatch, tmp_path):
+def test_stock_lifecycle_allows_cycle_and_blocks_wheel_entries(monkeypatch, tmp_path):
     root, cfg = _root(monkeypatch, tmp_path)
     _write_check(root, "stock_lifecycle")
     _write_check(root, "wheel_lifecycle")
-    assert LG.gate_passed(root) == (True, "passed")
+    assert LG.gate_passed(root) == (True, "stock_lifecycle")
     calls = {}
     monkeypatch.setattr(desk, "_secret", lambda name: None)
     _install_cycle(monkeypatch, "expected-main", calls)
     assert desk.cmd_cycle(cfg, "AUTO_PAPER", "main") == 0
     assert calls["build"] == ("AUTO_PAPER", "main")
     assert calls["ran"] == ("AUTO_PAPER", True)
+    assert calls["policy"].wheel_entries is False
+    assert calls["policy"].label == "BLOCKED"
     assert _payloads(root, "main", "AUTO_PAPER_REFUSED") == []
+
+
+def test_wheel_entries_provisional_until_wheel_lifecycle(monkeypatch, tmp_path):
+    root, cfg = _root(monkeypatch, tmp_path)
+    _write_check(root, "stock_lifecycle")
+    _write_check(root, "wheel_sell_buyback")
+    calls = {}
+    monkeypatch.setattr(desk, "_secret", lambda name: None)
+    _install_cycle(monkeypatch, "expected-main", calls)
+    assert desk.cmd_cycle(cfg, "AUTO_PAPER", "main") == 0
+    assert calls["policy"].wheel_entries is True
+    assert calls["policy"].provisional is True
+    assert calls["policy"].label == "PROVISIONAL"
+    _write_check(root, "wheel_lifecycle")
+    assert desk.cmd_cycle(cfg, "AUTO_PAPER", "main") == 0
+    assert calls["policy"].wheel_entries is True
+    assert calls["policy"].provisional is False
+    assert calls["policy"].label == "RECORDED"
 
 
 def test_mechanics_auto_paper_is_not_gated(monkeypatch, tmp_path):
@@ -221,6 +243,7 @@ def test_mechanics_auto_paper_is_not_gated(monkeypatch, tmp_path):
     _install_cycle(monkeypatch, "mech-expected", calls)
     assert desk.cmd_cycle(cfg, "AUTO_PAPER", "mechanics") == 0
     assert calls["ran"][0] == "AUTO_PAPER"
+    assert calls["policy"] is None
     assert os.path.exists(AP.journal_path(root, "mechanics"))
     assert not os.path.exists(AP.journal_path(root, "main"))
     mech_report = os.path.join(AP.reports_dir(root, "mechanics"))
@@ -242,6 +265,7 @@ def test_dry_run_is_not_gated(monkeypatch, tmp_path):
     assert desk.cmd_cycle(cfg, "DRY_RUN", "main") == 0
     assert calls["build"] == ("DRY_RUN", "main")
     assert calls["ran"] == ("DRY_RUN", False)
+    assert calls["policy"] is None
     assert _payloads(root, "main", "AUTO_PAPER_REFUSED") == []
 
 
@@ -271,7 +295,7 @@ def test_lifecycle_record_does_not_write_raw_account_id(monkeypatch, tmp_path):
     monkeypatch.setattr(desk, "doctor", lambda *a, **k: (True, []))
     assert desk.main([
         "lifecycle-record", "--account", "mechanics", "--check", "wheel",
-        "--evidence", "wheel assignment observed",
+        "--evidence", "OBSERVED_PAPER_ASSIGNMENT wheel assignment observed",
     ]) == 0
     text = open(LG.gate_path(root), encoding="utf-8").read()
     assert raw.lower() not in text.lower()
@@ -279,7 +303,13 @@ def test_lifecycle_record_does_not_write_raw_account_id(monkeypatch, tmp_path):
     rec = json.loads(text)["wheel_lifecycle"]
     assert rec["mechanics_account_id_sha256_prefix"] == LG.account_id_prefix(raw)
     assert set(rec) == set(LG.REQUIRED)
-    assert rec["evidence"] == "wheel assignment observed"
+    assert rec["evidence"] == "OBSERVED_PAPER_ASSIGNMENT wheel assignment observed"
+    mocked = desk.main([
+        "lifecycle-record", "--account", "mechanics", "--check", "wheel",
+        "--evidence", "MOCK OBSERVED_PAPER_ASSIGNMENT not a broker fill",
+    ])
+    assert mocked == 2
+    assert "wheel_lifecycle" in json.loads(open(LG.gate_path(root), encoding="utf-8").read())
     assert rec["config_hash"] == cfg.config_hash
     leaked = desk.main([
         "lifecycle-record", "--account", "mechanics", "--check", "stock",
@@ -299,12 +329,24 @@ def test_doctor_main_lifecycle_gate_does_not_fail_doctor(monkeypatch, tmp_path, 
     out = capsys.readouterr().out
     assert ok
     assert "[BLOCKED] lifecycle_gate:" in out
+    assert "[NOT_RECORDED] stock_lifecycle:" in out
+    assert "[NOT_RECORDED] wheel_sell_buyback:" in out
+    assert "[NOT_RECORDED] wheel_lifecycle:" in out
+    assert "[PASS] wheel_mock_tests:" in out
     assert [flag for name, flag, _detail in checks if name == "lifecycle_gate"] == [True]
     _write_check(root, "stock_lifecycle")
+    _write_check(root, "wheel_sell_buyback")
+    ok, _checks = desk.doctor(cfg, verbose=True, online=False, account="main")
+    assert ok
+    provisional = capsys.readouterr().out
+    assert "[PROVISIONAL] wheel_lifecycle:" in provisional
+    assert "[PASS] lifecycle_gate:" in provisional
     _write_check(root, "wheel_lifecycle")
     ok, _checks = desk.doctor(cfg, verbose=True, online=False, account="main")
     assert ok
-    assert "[PASS] lifecycle_gate:" in capsys.readouterr().out
+    recorded = capsys.readouterr().out
+    assert "[RECORDED] wheel_lifecycle:" in recorded
+    assert "[PASS] lifecycle_gate:" in recorded
 
 
 def test_doctor_mechanics_checks_only_mech_secrets(monkeypatch, tmp_path, capsys):

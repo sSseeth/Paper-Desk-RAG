@@ -9,6 +9,27 @@ from .secrets_store import redact
 MAX_ATTEMPTS = 12
 
 
+def is_mechanics_test_event(event):
+    """True for a mechanics-test journal row. Those rows are not performance."""
+    if event["kind"] == "MECHANICS_STEP" or event["kind"] == "MECHANICS_TRACK":
+        return True
+    try:
+        payload = json.loads(event["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return payload.get("series") == "mechanics-test"
+
+
+def performance_events(journal):
+    """Investment-performance series.
+
+    Mechanics-test steps stay in the mechanics journal and are excluded here
+    even if one was written into this journal by mistake. Benchmarks are not
+    built from these rows.
+    """
+    return [event for event in journal.events() if not is_mechanics_test_event(event)]
+
+
 def stamp(cfg):
     prof = cfg.feed_profile
     return {"experiment_id": cfg.policy["experiment_id"], "strategy_version": cfg.strategy_version,
@@ -59,22 +80,31 @@ def write_local(root, cfg, journal, summary, session_label, directory=None):
     d = directory or os.path.join(root, "reports")
     os.makedirs(d, exist_ok=True)
     st = stamp(cfg)
+    mechanics_dir = directory and os.path.basename(os.path.normpath(directory)) == "mechanics"
+    events = journal.events() if mechanics_dir else performance_events(journal)
+    wheel_label = summary.get("wheel_lifecycle_label")
     csv_path = os.path.join(d, f"events_{session_label}.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["# feed_profile", st["feed_profile"], "option_quotes", st["option_quotes"], "config_hash",
                     st["config_hash"]])
+        if wheel_label:
+            w.writerow(["# wheel_lifecycle", wheel_label])
         cols = ["seq", "event_id", "ts_utc", "ts_sydney", "experiment_id", "strategy_version", "config_hash",
                 "feed_profile", "run_id", "kind", "strategy", "symbol", "payload"]
         w.writerow(cols)
-        for e in journal.events():
+        for e in events:
             w.writerow([redact(str(e[c])) for c in cols])
     html_path = os.path.join(d, f"report_{session_label}.html")
     body = json.dumps({"stamp": st, **summary}, indent=2, default=str)
+    wheel_line = ""
+    if wheel_label:
+        wheel_line = f" | Wheel lifecycle: <b>{html.escape(str(wheel_label))}</b>"
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(f"<html><head><meta charset='utf-8'><title>sSseethPaperDesk {html.escape(session_label)}</title></head>"
                 f"<body><h1>sSseethPaperDesk report {html.escape(session_label)}</h1>"
                 f"<p><b>Feed profile: {html.escape(st['feed_profile'])}</b> | Option quotes: "
-                f"<b>{html.escape(st['option_quotes'])}</b> | PAPER ONLY | config {st['config_hash']}</p>"
+                f"<b>{html.escape(st['option_quotes'])}</b> | PAPER ONLY | config {st['config_hash']}"
+                f"{wheel_line}</p>"
                 f"<pre>{html.escape(redact(body))}</pre></body></html>")
     return html_path, csv_path

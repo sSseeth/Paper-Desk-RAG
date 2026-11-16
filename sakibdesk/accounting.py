@@ -33,6 +33,10 @@ def bh_value(bh, price, dividends_per_share=0.0):
 
 
 def spy_benchmarks(spy_start, capital):
+    """SPY buy-and-hold from the policy capital split.
+
+    Mechanics-test fills are not an input. The series is the main book's capital.
+    """
     return {name: buy_and_hold(capital[k], spy_start) for name, k in
             (("COMBINED_vs_SPY", "initial"), ("STOCK_vs_SPY", "stock"), ("WHEEL_vs_SPY", "wheel"))}
 

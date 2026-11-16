@@ -35,17 +35,17 @@
     {
       "check": "Stock lifecycle",
       "status": "blocked",
-      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits implemented and mock-tested. The lifecycle gate is now enforced in code: main-account AUTO_PAPER stays refused until stock_lifecycle is recorded from a separate mechanics paper account. Guide page 20 checks on that account have not been run."
+      "reason": "Bracket entry, cancel-confirm, partial-fill OCO protection and strategy exits are implemented. mechanics-test --suite stock drives them on the mechanics paper account during regular US hours and can record stock_lifecycle. Main AUTO_PAPER stays refused until that check is recorded. The guided run has not been observed in this repository yet."
     },
     {
       "check": "Wheel lifecycle",
       "status": "blocked",
-      "reason": "State machine, screen, collateral, buyback and covered calls mock-tested. The lifecycle gate is now enforced in code: main-account AUTO_PAPER stays refused until wheel_lifecycle is recorded from a separate mechanics paper account. Guide page 20 checks have not been run, and real expiries take days to weeks. Label PROVISIONAL."
+      "reason": "State machine, screen, collateral, buyback and covered calls are mock-tested. mechanics-test --suite wheel-sell-buyback records wheel_sell_buyback. Wheel entries on main stay blocked until that check and the mock paths pass, and they are labelled PROVISIONAL until wheel_lifecycle. Real expiry and assignment take days to weeks. Do not call the wheel book fully verified before that."
     },
     {
       "check": "Assignment limits",
       "status": "tested-offline",
-      "reason": "Evidence = mock transitions only (incl. next-day activity lag). No observed paper assignment exists."
+      "reason": "Mock state transitions prove code paths only. mechanics-test --suite wheel-expiry labels OBSERVED_PAPER_ASSIGNMENT or MOCK from broker activities. Only a full observed assignment, 100 reserved shares, covered call, and delivery or expiry records wheel_lifecycle. No observed paper assignment is stored in this repository."
     },
     {
       "check": "Notification and scheduler",
@@ -65,7 +65,7 @@
     {
       "check": "AUTO_PAPER",
       "status": "blocked",
-      "reason": "Off. The desk is used manually. The lifecycle gate is now enforced in code: AUTO_PAPER on the main account is refused until both the stock and Wheel lifecycle checks are recorded from the separate mechanics paper account. Research-check on v1.7 is also still required before new entries. DRY_RUN is not gated."
+      "reason": "Off. The desk is used manually. Main AUTO_PAPER is refused until stock_lifecycle is recorded from the mechanics account. Wheel entries also need wheel_sell_buyback and the mock wheel paths, and stay PROVISIONAL until wheel_lifecycle. Research-check on v1.7 is also still required before new entries. DRY_RUN is not gated. A missing or corrupt gate file fails closed."
     }
   ]
 }

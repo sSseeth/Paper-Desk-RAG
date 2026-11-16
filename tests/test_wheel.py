@@ -8,6 +8,11 @@ from sakibdesk.ledger import Ledger
 P = json.load(open(__import__("conftest").ROOT + "/policy.json"))["wheel"]
 
 
+def test_mock_paths_pass_matches_the_state_machine():
+    ok, detail = W.mock_paths_pass()
+    assert ok, detail
+
+
 def test_full_wheel_sequence():
     seq = ["PUT_SUBMITTED", "PUT_FILLED", "ASSIGNMENT_CONFIRMED", "CALL_SUBMITTED", "CALL_FILLED",
            "BUYBACK_SUBMITTED", "BUYBACK_FILLED", "CALL_SUBMITTED", "CALL_FILLED", "ASSIGNMENT_CONFIRMED"]

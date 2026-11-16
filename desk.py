@@ -76,14 +76,16 @@ def _account_mismatch(deps):
     return not C.account_matches(acct, deps.expected_account_id)
 
 
+_LIFECYCLE_LINES = {
+    "lifecycle_gate", "stock_lifecycle", "wheel_sell_buyback", "wheel_lifecycle", "wheel_mock_tests",
+}
+
+
 def _print_doctor_line(name, ok, detail):
-    if name == "lifecycle_gate":
-        # BLOCKED is informational. DRY_RUN stays available, so this line does not fail doctor.
-        state = "PASS" if detail == "PASS" else "BLOCKED"
-        if state == "PASS":
-            text = "stock_lifecycle and wheel_lifecycle recorded"
-        else:
-            text = "stock_lifecycle and wheel_lifecycle are not both recorded"
+    # Lifecycle lines carry STATE|text. BLOCKED and PROVISIONAL do not fail doctor.
+    # A failed mock wheel path does, via the ok flag on wheel_mock_tests.
+    if name in _LIFECYCLE_LINES and "|" in str(detail):
+        state, text = str(detail).split("|", 1)
         print(f"[{state}] {name}: {text}")
         return
     print(f"[{'PASS' if ok else 'FAIL'}] {name}: {detail}")
@@ -106,8 +108,7 @@ def doctor(cfg, verbose=True, online=True, account="main"):
         checks.append(("distinct_expected_accounts", False,
                        "mechanics expected account id equals the main expected account id"))
     if account == "main":
-        gate_ok, _gate_why = LG.gate_passed(ROOT)
-        checks.append(("lifecycle_gate", True, "PASS" if gate_ok else "BLOCKED"))
+        checks.extend(LG.doctor_rows(ROOT))
     if not miss and online and not share:
         try:
             deps = build_deps(cfg, "DRY_RUN", account)
@@ -145,13 +146,17 @@ def cmd_cycle(cfg, mode, account="main"):
             j = Journal(AP.journal_path(ROOT, account), cfg)
             # Fail closed before any writer exists. Mechanics is where the checks run, so it is not gated.
             # DRY_RUN never consults the gate.
-            if mode == "AUTO_PAPER" and account == "main" and not LG.gate_passed(ROOT)[0]:
-                print("AUTO_PAPER refused: the mechanics lifecycle gate has not passed. "
-                      "Record stock_lifecycle and wheel_lifecycle with "
-                      "lifecycle-record --account mechanics before AUTO_PAPER on main. "
-                      "reason=LIFECYCLE_GATE_NOT_PASSED")
-                j.event("AUTO_PAPER_REFUSED", {"reason": "LIFECYCLE_GATE_NOT_PASSED"})
-                return 2
+            entry_policy = None
+            if mode == "AUTO_PAPER" and account == "main":
+                allowed, why = LG.gate_passed(ROOT)
+                if not allowed:
+                    print("AUTO_PAPER refused: stock_lifecycle is not recorded. "
+                          "Main AUTO_PAPER stays refused until "
+                          "lifecycle-record --account mechanics --check stock. "
+                          f"reason=LIFECYCLE_GATE_NOT_PASSED ({why})")
+                    j.event("AUTO_PAPER_REFUSED", {"reason": "LIFECYCLE_GATE_NOT_PASSED"})
+                    return 2
+                entry_policy = LG.wheel_entry_decision(ROOT)
             if _profiles_share_expected_id():
                 return _refuse_same_account(j, mode)
             start_hash = cfg.config_hash
@@ -169,7 +174,7 @@ def cmd_cycle(cfg, mode, account="main"):
             deps = read_deps if mode == "DRY_RUN" else build_deps(cfg, "AUTO_PAPER", account)
             if deps.research:
                 deps.research.j = j; deps.research.clock = j.clock
-            summary = C.run_cycle(cfg, j, mode, deps, ROOT)
+            summary = C.run_cycle(cfg, j, mode, deps, ROOT, entry_policy=entry_policy)
             if Config(ROOT).config_hash != start_hash:
                 j.event("POLICY_CHANGED_DURING_RUN", {"start": start_hash})
                 summary["entry_blocks"].append("POLICY_CHANGED_DURING_RUN")
@@ -600,6 +605,57 @@ def cmd_flatten(cfg, account="main"):
     return 0
 
 
+def cmd_mechanics_test(cfg, account, suite, record, start, reconcile):
+    """Run one mechanics lifecycle suite. Refuses `--account main` before any client exists."""
+    from sakibdesk import mechanics_test as MT
+    if account != "mechanics":
+        print("mechanics-test refused: this command only runs with --account mechanics. "
+              "It does not read or trade the main account.")
+        return 2
+    if suite == "wheel-expiry":
+        if start == reconcile:
+            print("mechanics-test refused: --suite wheel-expiry needs exactly one of --start or --reconcile.")
+            return 2
+    elif start or reconcile:
+        print("mechanics-test refused: --start and --reconcile belong to --suite wheel-expiry only.")
+        return 2
+    if _profiles_share_expected_id():
+        print("mechanics-test refused: the mechanics expected account id equals the main expected account id. "
+              "Nothing was sent.")
+        return 2
+    passed, _checks = doctor(cfg, verbose=True, online=True, account="mechanics")
+    if not passed:
+        print("mechanics-test refused: mechanics doctor checks did not pass. Nothing was sent.")
+        return 2
+    deps = build_deps(cfg, "AUTO_PAPER", "mechanics")
+    if deps.reader is None or deps.writer is None:
+        print("mechanics-test refused: the mechanics paper client was not built. Nothing was sent.")
+        return 2
+    if _account_mismatch(deps):
+        print("mechanics-test refused: the broker account does not match the mechanics expected account id. "
+              "Nothing was sent.")
+        return 2
+    expected = _secret("MECH_ALPACA_EXPECTED_ACCOUNT_ID")
+    j = Journal(AP.journal_path(ROOT, "mechanics"), cfg)
+    try:
+        with ProcessLock(AP.lock_path(ROOT, "mechanics")):
+            if suite == "stock":
+                return MT.run_stock_suite(
+                    cfg, j, deps.reader, deps.writer, deps.md, root=ROOT,
+                    expected_account_id=expected, record=record)
+            if suite == "wheel-sell-buyback":
+                return MT.run_wheel_sell_buyback(
+                    cfg, j, deps.reader, deps.writer, deps.md, root=ROOT,
+                    expected_account_id=expected, record=True)
+            action = "start" if start else "reconcile"
+            return MT.run_wheel_expiry(
+                cfg, j, deps.reader, deps.writer, deps.md, root=ROOT,
+                expected_account_id=expected, action=action, record=True)
+    except AlreadyRunning:
+        print("Another mechanics command holds the lock; nothing was sent.")
+        return 2
+
+
 def cmd_lifecycle_record(cfg, account, check, evidence):
     """Record one mechanics lifecycle check after read-only broker checks pass.
 
@@ -650,9 +706,20 @@ def main(argv=None):
     cy.add_argument("--mode", required=True, choices=["DRY_RUN", "AUTO_PAPER"])
     lr = sub.add_parser("lifecycle-record", parents=[parent])
     lr.add_argument("--check", required=True, choices=sorted(LG.CLI_CHECKS),
-                    help="stock or wheel. Stored as stock_lifecycle or wheel_lifecycle.")
+                    help="stock, wheel-sell-buyback, or wheel. "
+                         "wheel requires OBSERVED_PAPER_ASSIGNMENT and rejects MOCK.")
     lr.add_argument("--evidence", required=True,
                     help="Short note of what was observed. Do not include the account id.")
+    mt = sub.add_parser("mechanics-test", parents=[parent])
+    mt.add_argument("--suite", required=True, choices=["stock", "wheel-sell-buyback", "wheel-expiry"])
+    mt.add_argument("--record", action="store_true",
+                    help="After a passing stock suite, record stock_lifecycle. "
+                         "wheel-sell-buyback records on PASS either way. "
+                         "wheel-expiry records wheel_lifecycle only after full observed completion.")
+    mt.add_argument("--start", action="store_true",
+                    help="wheel-expiry: sell the near-expiry put and record the intent.")
+    mt.add_argument("--reconcile", action="store_true",
+                    help="wheel-expiry: reconcile assignment, the covered call, and delivery or expiry.")
     a = ap.parse_args(argv)
     account = a.account
     if a.cmd == "setup-secrets":
@@ -666,6 +733,8 @@ def main(argv=None):
         return cmd_cycle(cfg, a.mode, account)
     if a.cmd == "lifecycle-record":
         return cmd_lifecycle_record(cfg, account, a.check, a.evidence)
+    if a.cmd == "mechanics-test":
+        return cmd_mechanics_test(cfg, account, a.suite, a.record, a.start, a.reconcile)
     return {"report": cmd_report, "snapshot": cmd_snapshot, "research-check": cmd_research_check,
             "pause": cmd_pause, "resume": cmd_resume, "flatten": cmd_flatten}[a.cmd](cfg, account)
 
