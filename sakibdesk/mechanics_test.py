@@ -237,16 +237,68 @@ def _risk_unit(cfg, md, symbol, entry, today):
     return risk
 
 
+_DONE = {"filled", "canceled", "expired", "rejected"}
+
+
 def _cancel_open(om, reader, order_id, client_order_id=None):
     order = reader.order(order_id) if order_id else None
     if order is None:
         return None
-    if order.get("status") in ("filled", "canceled", "expired", "rejected"):
+    if order.get("status") in _DONE:
         for leg in order.get("legs") or []:
-            if leg.get("status") not in ("filled", "canceled", "expired", "rejected"):
+            if leg.get("status") not in _DONE and leg.get("id"):
                 om.cancel_and_confirm(reader, leg["id"])
         return order
     return om.cancel_and_confirm(reader, order_id, client_order_id)
+
+
+def _cancel_confirmed(om, reader, order_id, client_order_id=None):
+    """Cancel one order. True only when that order and its legs are terminal.
+
+    An accepted OCO holds the shares (`held_for_orders`) until this returns.
+    """
+    order = reader.order(order_id) if order_id else None
+    if order is None:
+        return False
+    if order.get("status") not in _DONE:
+        confirmed = om.cancel_and_confirm(reader, order_id, client_order_id)
+        if confirmed is None or confirmed.get("status") not in _DONE:
+            return False
+        order = reader.order(order_id) or confirmed
+    for leg in order.get("legs") or []:
+        if leg.get("status") in _DONE or not leg.get("id"):
+            continue
+        confirmed = om.cancel_and_confirm(reader, leg["id"])
+        if confirmed is None or confirmed.get("status") not in _DONE:
+            return False
+    return True
+
+
+def _release_sells(om, reader, ids, symbol):
+    """Confirm-cancel resting sells for `symbol`, including an OCO parent limit."""
+    targets, seen = [], set()
+
+    def add(order_id, cid=None):
+        if order_id and order_id not in seen:
+            seen.add(order_id)
+            targets.append((order_id, cid))
+
+    for item in list(ids):
+        order = reader.order(item["id"]) if item.get("id") else None
+        if not order or order.get("symbol") != symbol:
+            continue
+        if order.get("side") == "sell" and order.get("status") not in _DONE:
+            add(item["id"], item.get("cid"))
+        for leg in order.get("legs") or []:
+            if leg.get("side") in (None, "sell") and leg.get("status") not in _DONE:
+                add(leg.get("id"))
+    for order in reader.orders("open") or []:
+        if order.get("symbol") == symbol and order.get("side") == "sell" and order.get("status") not in _DONE:
+            add(order.get("id"))
+    for order_id, cid in targets:
+        if not _cancel_confirmed(om, reader, order_id, cid):
+            return False
+    return True
 
 
 def _remember(ids, result):
@@ -256,11 +308,25 @@ def _remember(ids, result):
     return result
 
 
+def _resting_sell(leg, types):
+    """One resting exit. A missing side is allowed; a buy is not the target or the stop."""
+    if not leg or leg.get("side") not in (None, "sell"):
+        return False
+    return leg.get("type") in types and leg.get("status") in _RESTING
+
+
 def _legs_live(order):
-    legs = (order or {}).get("legs") or []
-    stops = [leg for leg in legs if leg.get("type") in ("stop", "stop_limit") and leg.get("status") in _RESTING]
-    targets = [leg for leg in legs if leg.get("type") == "limit" and leg.get("status") in _RESTING]
-    return len(stops) >= 1 and len(targets) >= 1
+    """Exactly one resting limit sell and one resting stop, parent and legs together.
+
+    OCO (Alpaca, nested): the parent is the take-profit limit (`new`, `accepted`,
+    or `held`) and `legs` contains only the stop, often `held`. Bracket: the
+    parent is the entry buy and both exits are in `legs`. Requiring the limit
+    to appear inside `legs` rejects a live OCO.
+    """
+    group = S.protection_orders(order)
+    stops = [leg for leg in group if _resting_sell(leg, ("stop", "stop_limit"))]
+    targets = [leg for leg in group if _resting_sell(leg, ("limit",))]
+    return len(stops) == 1 and len(targets) == 1
 
 
 class _ScratchBroker:
@@ -600,10 +666,20 @@ def _step_exit(cfg, journal, om, reader, md, ids, rows, symbol, attempts, interv
         rows.append(row)
         journal_step(journal, "strategy_exit", None, "BROKER", "FAIL", symbol, {"position_qty": held})
         return
-    for item in list(ids):
-        order = reader.order(item["id"])
-        if order and order.get("side") == "sell" and order.get("status") in _OPEN:
-            _cancel_open(om, reader, item["id"], item.get("cid"))
+    # The OCO parent is a resting limit sell, so the shares are held_for_orders
+    # until that cancel is confirmed. The cycle does the same before a strategy exit.
+    if not _release_sells(om, reader, ids, symbol):
+        row = _row("strategy_exit", "FAIL", "BROKER", None,
+                   "protective order cancel was not confirmed; shares stay held_for_orders")
+        rows.append(row)
+        journal_step(journal, "strategy_exit", None, "BROKER", "FAIL", symbol, {"note": row["note"]})
+        return
+    held = equity_qty(reader.positions(), symbol)
+    if held != MC.STOCK_ENTRY_QTY:
+        row = _row("strategy_exit", "FAIL", "BROKER", None, f"position qty {held} is not the test quantity")
+        rows.append(row)
+        journal_step(journal, "strategy_exit", None, "BROKER", "FAIL", symbol, {"position_qty": held})
+        return
     quote = _quote(md, symbol)
     if not quote.get("bp"):
         rows.append(_row("strategy_exit", "FAIL", "BROKER", None, "no bid for the strategy exit"))
@@ -624,9 +700,13 @@ def _step_exit(cfg, journal, om, reader, md, ids, rows, symbol, attempts, interv
 
 
 def _flatten_shares(cfg, journal, om, reader, md, ids, symbol, qty, attempts, interval, sleep):
-    """Cancel this run's orders and sell only the shares this run bought."""
-    for item in list(ids):
-        _cancel_open(om, reader, item["id"], item.get("cid"))
+    """Cancel this run's orders and sell only the shares this run bought.
+
+    The sell waits until the protective OCO cancel is confirmed. A working
+    OCO keeps the shares held_for_orders, and a limit sell submitted then is rejected.
+    """
+    if not _release_sells(om, reader, ids, symbol):
+        return
     held = equity_qty(reader.positions(), symbol)
     sell_qty = int(min(held, qty)) if qty and held > 0 else 0
     if sell_qty < 1:
@@ -655,14 +735,24 @@ def _cash(reader):
         return None
 
 
-def select_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash, allowance, mode):
-    """Nearest listed put that fits the account.
+def _filter_summary(counts):
+    """One line an operator can match to the stage that emptied the chain."""
+    return ("contracts listed {listed}, after DTE filter {dte}, "
+            "after strike filter {strike}, with positive bid {bid}").format(**counts)
 
-    `far` is at or below 80% of the bid. `itm` is at or above 101% of the ask.
-    Strikes above the mechanics cap, or whose strike*100+allowance exceeds
-    cash, are skipped.
+
+def _choose_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash, allowance, mode):
+    """Return `(chosen or None, counts)` for a far or slightly-ITM put.
+
+    `far` is the highest strike at or below `FAR_OTM_FRACTION` of the bid on
+    the nearest expiry that has a positive, sellable bid. `itm` is the lowest
+    strike at or above 101% of the ask. Strikes above the mechanics cap, or
+    whose strike*100+allowance exceeds cash, are skipped. Counts are the
+    contracts that survived each stage, so a refusal says which filter was empty.
     """
+    counts = {"listed": len(contracts or []), "dte": 0, "strike": 0, "bid": 0}
     by_exp = {}
+    max_dte = MC.SELL_BUYBACK_MAX_DTE if mode == "far" else MC.EXPIRY_MAX_DTE
     for contract in contracts or []:
         if contract.get("type") != "put":
             continue
@@ -673,11 +763,9 @@ def select_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash,
         if not exp:
             continue
         dte = (date.fromisoformat(exp) - today).days
-        if dte < MC.MIN_DTE:
+        if dte < MC.MIN_DTE or dte > max_dte:
             continue
-        max_dte = MC.SELL_BUYBACK_MAX_DTE if mode == "far" else MC.EXPIRY_MAX_DTE
-        if dte > max_dte:
-            continue
+        counts["dte"] += 1
         try:
             strike = float(contract["strike_price"])
         except (KeyError, TypeError, ValueError):
@@ -687,16 +775,19 @@ def select_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash,
         need = strike * 100 + allowance
         if need > cash:
             continue
+        if mode == "far" and strike > float(spot_bid) * MC.FAR_OTM_FRACTION:
+            continue
+        if mode == "itm" and strike + 1e-9 < float(spot_ask) * MC.ITM_FRACTION:
+            continue
+        counts["strike"] += 1
         quote = ((snaps or {}).get(contract.get("symbol")) or {}).get("latestQuote") or {}
         try:
             bid = float(quote.get("bp") or 0)
         except (TypeError, ValueError):
             bid = 0.0
+        if bid > 0:
+            counts["bid"] += 1
         if bid <= 0 or W.tick_round_down(bid) <= 0:
-            continue
-        if mode == "far" and strike > float(spot_bid) * MC.FAR_OTM_FRACTION:
-            continue
-        if mode == "itm" and strike + 1e-9 < float(spot_ask) * MC.ITM_FRACTION:
             continue
         by_exp.setdefault(exp, []).append({
             "symbol": contract["symbol"], "strike": strike, "expiry": exp, "dte": dte,
@@ -705,9 +796,17 @@ def select_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash,
     for exp in sorted(by_exp):
         cands = by_exp[exp]
         if mode == "far":
-            return max(cands, key=lambda item: (item["strike"], item["symbol"]))
-        return min(cands, key=lambda item: (item["strike"], item["symbol"]))
-    return None
+            return max(cands, key=lambda item: (item["strike"], item["symbol"])), counts
+        return min(cands, key=lambda item: (item["strike"], item["symbol"])), counts
+    return None, counts
+
+
+def select_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash, allowance, mode):
+    """Nearest listed put that fits the account. See `_choose_put` for the filters."""
+    chosen, _counts = _choose_put(
+        contracts, snaps, underlying=underlying, today=today, spot_bid=spot_bid, spot_ask=spot_ask,
+        cash=cash, allowance=allowance, mode=mode)
+    return chosen
 
 
 def select_call(contracts, snaps, *, underlying, today, spot_ask):
@@ -753,10 +852,16 @@ def _session_date(reader, journal):
     return date.fromisoformat(str(stamp)[:10])
 
 
-def _listed(reader, md, underlying, today, kind, horizon):
+def _listed(reader, md, underlying, today, kind, horizon, strike_lte=None, strike_gte=None):
+    """Contracts in the mechanics DTE window, then indicative snapshots for those symbols."""
     start = (today + timedelta(days=MC.MIN_DTE)).isoformat()
     end = (today + timedelta(days=horizon)).isoformat()
-    contracts = reader.option_contracts(underlying, start, end, kind) or []
+    kwargs = {}
+    if strike_lte is not None:
+        kwargs["strike_lte"] = strike_lte
+    if strike_gte is not None:
+        kwargs["strike_gte"] = strike_gte
+    contracts = reader.option_contracts(underlying, start, end, kind, **kwargs) or []
     symbols = [contract.get("symbol") for contract in contracts if contract.get("symbol")]
     snaps = md.option_snapshots(symbols) if symbols else {}
     return contracts, snaps or {}
@@ -832,12 +937,15 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
         print("Refused: mechanics cash is unreadable. Nothing was sent.")
         return 2
     today = _session_date(reader, journal)
-    contracts, snaps = _listed(reader, md, underlying, today, "put", MC.SELL_BUYBACK_MAX_DTE)
-    chosen = select_put(contracts, snaps, underlying=underlying, today=today, spot_bid=bid, spot_ask=ask,
-                        cash=cash, allowance=_allowance(cfg), mode="far")
+    # Cap the chain at the far strike so a short page of high strikes cannot hide it.
+    far_cap = min(MC.WHEEL_MAX_STRIKE, float(bid) * MC.FAR_OTM_FRACTION)
+    contracts, snaps = _listed(reader, md, underlying, today, "put", MC.SELL_BUYBACK_MAX_DTE,
+                               strike_lte=far_cap)
+    chosen, counts = _choose_put(contracts, snaps, underlying=underlying, today=today, spot_bid=bid,
+                                 spot_ask=ask, cash=cash, allowance=_allowance(cfg), mode="far")
     if chosen is None:
         print("Refused: no far-OTM weekly put whose strike*100 plus allowance fits mechanics cash. "
-              "Nothing was sent.")
+              f"Nothing was sent. {_filter_summary(counts)}")
         return 2
     ids = []
     rows = []
@@ -970,11 +1078,14 @@ def _expiry_start(cfg, journal, reader, writer, md, attempts, interval, sleep):
         print("Refused: mechanics cash is unreadable. Nothing was sent.")
         return 2
     today = _session_date(reader, journal)
-    contracts, snaps = _listed(reader, md, underlying, today, "put", MC.EXPIRY_MAX_DTE)
-    chosen = select_put(contracts, snaps, underlying=underlying, today=today, spot_bid=bid, spot_ask=ask,
-                        cash=cash, allowance=_allowance(cfg), mode="itm")
+    contracts, snaps = _listed(
+        reader, md, underlying, today, "put", MC.EXPIRY_MAX_DTE,
+        strike_gte=float(ask) * MC.ITM_FRACTION, strike_lte=MC.WHEEL_MAX_STRIKE)
+    chosen, counts = _choose_put(contracts, snaps, underlying=underlying, today=today, spot_bid=bid,
+                                 spot_ask=ask, cash=cash, allowance=_allowance(cfg), mode="itm")
     if chosen is None:
-        print("Refused: no near-expiry slightly-ITM put that fits mechanics cash. Nothing was sent.")
+        print("Refused: no near-expiry slightly-ITM put that fits mechanics cash. "
+              f"Nothing was sent. {_filter_summary(counts)}")
         return 2
     ledger = Ledger(journal, cfg.policy)
     om = OrderManager(journal, cfg, writer=writer, ledger=ledger)

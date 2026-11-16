@@ -101,10 +101,53 @@ def exit_due(bars_completed, entry_session, today, calendar, p):
     return None
 
 
+_EXIT_TYPES = ("limit", "stop", "stop_limit")
+_PROTECTIVE = ("new", "accepted", "held", "pending_new", "partially_filled")
+
+
+def parent_is_exit(order):
+    """True when `order` is itself a protective sell, not a bracket entry.
+
+    Alpaca's OCO response makes the take-profit limit the parent and puts only
+    the stop in `legs` (often status ``held``). A bracket's parent is the
+    entry; both exits are children. See orders-at-alpaca (OCO and bracket).
+    """
+    if not order or order.get("order_class") == "bracket":
+        return False
+    if order.get("order_class") == "oco":
+        return True
+    return (order.get("side") == "sell" and order.get("type") in _EXIT_TYPES
+            and bool(order.get("legs")))
+
+
+def protection_orders(order):
+    """Parent plus legs when the parent is the OCO take-profit; otherwise the legs.
+
+    Counting only `legs` misses the limit on an accepted OCO. A bracket entry
+    is not included, so its buy limit is not treated as the target.
+    """
+    if not order:
+        return []
+    legs = [leg for leg in (order.get("legs") or []) if isinstance(leg, dict)]
+    if not parent_is_exit(order):
+        return legs
+    parent_id = order.get("id")
+    if parent_id and any(leg.get("id") == parent_id for leg in legs):
+        return legs
+    return [order] + legs
+
+
 def protection_gap(filled_qty, legs):
-    """Partial fill coverage: active protective legs must cover exactly the filled shares."""
-    active = [l for l in legs if l.get("status") in ("new", "accepted", "held", "pending_new", "partially_filled")]
-    stop_q = sum(float(l["qty"]) - float(l.get("filled_qty") or 0) for l in active if l.get("type") in ("stop", "stop_limit"))
-    tp_q = sum(float(l["qty"]) - float(l.get("filled_qty") or 0) for l in active if l.get("type") == "limit")
+    """Partial fill coverage: active protective orders must cover exactly the filled shares.
+
+    `legs` is the bracket's child orders, or parent plus the stop for an OCO
+    (`protection_orders`). A resting limit sell is the target. Status ``held``
+    is active: Alpaca holds the stop until the limit is the working order.
+    """
+    active = [leg for leg in legs or [] if leg.get("status") in _PROTECTIVE]
+    stop_q = sum(float(leg["qty"]) - float(leg.get("filled_qty") or 0) for leg in active
+                 if leg.get("type") in ("stop", "stop_limit"))
+    tp_q = sum(float(leg["qty"]) - float(leg.get("filled_qty") or 0) for leg in active
+               if leg.get("type") == "limit")
     return {"filled": filled_qty, "stop_cover": stop_q, "target_cover": tp_q,
             "ok": abs(stop_q - filled_qty) < 1e-9 and abs(tp_q - filled_qty) < 1e-9}

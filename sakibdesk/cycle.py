@@ -193,8 +193,9 @@ def reconcile_stock(cfg, journal, om, reader, positions, today, summary):
             journal.event("STOCK_POSITION_OPENED", {"qty": it["filled_qty"], "avg": it["filled_avg_price"]}, "STOCK", sym)
         if it["status"] in ("filled", "canceled", "expired"):
             o = reader.order_by_client_id(it["client_order_id"])
-            if o and o.get("legs") is not None:
-                gap = S.protection_gap(float(it["filled_qty"]), o["legs"])
+            # Bracket exits live in legs. An OCO's limit is the parent.
+            if o and (o.get("legs") is not None or S.parent_is_exit(o)):
+                gap = S.protection_gap(float(it["filled_qty"]), S.protection_orders(o))
                 if not gap["ok"] and sym in held:
                     journal.event("PROTECTION_MISMATCH", gap, "STOCK", sym)
                     fix_protection(cfg, journal, om, reader, it, o, gap, summary)
@@ -206,11 +207,22 @@ def reconcile_stock(cfg, journal, om, reader, positions, today, summary):
 
 
 def fix_protection(cfg, journal, om, reader, it, o, gap, summary):
-    """Cancel mismatched legs (confirmed), then protect exactly the filled shares with an OCO."""
-    for leg in o["legs"]:
-        if leg.get("status") in ("new", "accepted", "held", "pending_new"):
-            if om.cancel_and_confirm(reader, leg["id"]) is None:
+    """Cancel mismatched protection (confirmed), then cover the filled shares with an OCO.
+
+    Cancel an OCO by its parent id: that parent is the limit sell, and Alpaca
+    cancels the held stop with it. A bracket entry is not that parent; its
+    exits are the legs.
+    """
+    resting = ("new", "accepted", "held", "pending_new")
+    if S.parent_is_exit(o):
+        if o.get("status") in resting and o.get("id"):
+            if om.cancel_and_confirm(reader, o["id"]) is None:
                 return
+    else:
+        for leg in o.get("legs") or []:
+            if leg.get("status") in resting and leg.get("id"):
+                if om.cancel_and_confirm(reader, leg["id"]) is None:
+                    return
     body = json.loads(it["body"])
     res = om.place(strategy="STOCK", symbol=it["symbol"], purpose="PROTECT_OCO", signal_key=it["client_order_id"],
                    body=protection_oco_body(it["symbol"], gap["filled"], body["take_profit"], body["stop_loss"]),

@@ -115,6 +115,89 @@ def test_local_reports_always_written(root, cfg, journal):
     assert "FREE_MECHANICS" in txt and "INDICATIVE" in txt
 
 
+class Rec:
+    """Scripted HTTP session. The response URL is the request URL so the host check passes."""
+
+    def __init__(self, fn):
+        self.fn, self.headers, self.calls = fn, {}, []
+
+    def request(self, method, url, params=None, json=None, timeout=None, allow_redirects=True):
+        self.calls.append((method, url, params))
+        code, payload = self.fn(url, params or {})
+        return JsonResp(code, payload, url)
+
+
+class JsonResp:
+    def __init__(self, code, payload, url):
+        self.status_code, self.url, self.headers = code, url, {}
+        self.content = json.dumps(payload).encode()
+        self.text = self.content.decode()
+
+    def json(self):
+        return json.loads(self.content)
+
+
+def test_order_lookup_requests_nested_legs():
+    seen = {}
+
+    def fn(url, params):
+        seen["url"] = url
+        seen["params"] = params
+        return 200, {"id": "1", "status": "filled", "legs": []}
+
+    A.PaperReader("k", "s", session=Rec(fn)).order_by_client_id("SPD-1")
+    assert seen["url"].endswith("/v2/orders:by_client_order_id")
+    assert seen["params"]["client_order_id"] == "SPD-1"
+    assert seen["params"]["nested"] == "true"
+
+
+def test_option_contracts_page_and_send_strike_type_and_status():
+    pages = {
+        None: {"option_contracts": [{"symbol": "HI", "strike_price": "30"}], "next_page_token": "N2"},
+        "N2": {"option_contracts": [{"symbol": "LO", "strike_price": "8"}], "next_page_token": None},
+    }
+
+    def fn(url, params):
+        assert url.endswith("/v2/options/contracts")
+        assert params["underlying_symbols"] == "F"
+        assert params["type"] == "put" and params["status"] == "active"
+        assert params["expiration_date_gte"] == "2026-11-17"
+        assert params["expiration_date_lte"] == "2026-12-07"
+        assert params["limit"] == 1000
+        assert params["strike_price_lte"] == 9.9
+        assert "page_token" not in params or params["page_token"] == "N2"
+        return 200, pages[params.get("page_token")]
+
+    out = A.PaperReader("k", "s", session=Rec(fn)).option_contracts(
+        "F", "2026-11-17", "2026-12-07", "put", strike_lte=9.9)
+    assert [row["symbol"] for row in out] == ["HI", "LO"]
+
+
+def test_option_snapshots_batch_paginate_and_pass_indicative_feed():
+    symbols = [f"S{i:03d}" for i in range(150)]
+
+    def fn(url, params):
+        assert url.endswith("/v1beta1/options/snapshots")
+        assert params["feed"] == "indicative"
+        assert params["limit"] == 1000
+        batch = params["symbols"].split(",")
+        assert len(batch) <= 100
+        tok = params.get("page_token")
+        if tok is None and len(batch) == 100:
+            return 200, {"snapshots": {batch[0]: {"latestQuote": {"bp": 0.1}}}, "next_page_token": "P2"}
+        if tok == "P2":
+            assert len(batch) == 100
+            return 200, {"snapshots": {sym: {"latestQuote": {"bp": 0.2}} for sym in batch},
+                         "next_page_token": None}
+        assert len(batch) == 50 and tok is None
+        return 200, {"snapshots": {sym: {"latestQuote": {"bp": 0.3}} for sym in batch},
+                     "next_page_token": None}
+
+    out = A.MarketData("k", "s", "iex", "indicative", session=Rec(fn)).option_snapshots(symbols)
+    assert len(out) == 150
+    assert out["S000"]["latestQuote"]["bp"] == 0.2
+
+
 def test_account_matches_id_or_number():
     from sakibdesk.cycle import account_matches
     a = {"id": "904837e3-3b76-47ec-b432-046db621571b", "account_number": "PA3ABCDEF123"}
