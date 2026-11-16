@@ -106,8 +106,13 @@ class FakeBroker:
                     return l
     def orders(self, status="open"):
         return [o for o in self.orders_by_cid.values() if o["status"] in ("new", "accepted", "partially_filled")]
-    def option_contracts(self, u, a, b, t):
-        return [c for c in self.contracts if c["underlying_symbol"] == u and c["type"] == t and a <= c["expiration_date"] <= b]
+    def option_contracts(self, u, a, b, t, strike_lte=None, strike_gte=None):
+        rows = [c for c in self.contracts if c["underlying_symbol"] == u and c["type"] == t and a <= c["expiration_date"] <= b]
+        if strike_lte is not None:
+            rows = [c for c in rows if float(c["strike_price"]) <= float(strike_lte) + 1e-9]
+        if strike_gte is not None:
+            rows = [c for c in rows if float(c["strike_price"]) + 1e-9 >= float(strike_gte)]
+        return rows
     def activities(self, *a, **k): return list(self.activities_list)
 
     # writer

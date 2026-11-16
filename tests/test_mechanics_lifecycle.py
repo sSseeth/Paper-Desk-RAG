@@ -11,7 +11,10 @@ from sakibdesk import lifecycle_gate as LG
 from sakibdesk import mechanics_config as MC
 from sakibdesk import mechanics_test as MT
 from sakibdesk import reports as RP
+from sakibdesk import stock as S
 from sakibdesk import wheel as W
+from sakibdesk.ledger import Ledger
+from sakibdesk.orders import OrderManager
 from sakibdesk.alpaca import BrokerError
 from sakibdesk.config import Config
 from sakibdesk.journal import Journal
@@ -62,7 +65,15 @@ class MechFake:
         self.partial_probe = False
         self.fail_oco = False
         self.fail_sells = False
+        self.confirm_cancels = True
         self.bars = {}
+
+    def _working_sell(self, sym):
+        open_status = {"new", "accepted", "pending_new", "partially_filled", "held"}
+        for order in self.book.values():
+            if order.get("symbol") == sym and order.get("side") == "sell" and order.get("status") in open_status:
+                return True
+        return False
 
     def account(self):
         return dict(self.acct)
@@ -107,12 +118,23 @@ class MechFake:
         sym = body["symbol"]
         status, filled, avg, legs = "accepted", "0", None, None
         if body.get("order_class") == "oco":
+            # Alpaca OCO: parent is the take-profit limit; the only leg is the stop, held.
+            status = "new"
+            legs = [{
+                "id": oid + "-sl", "type": "stop", "side": "sell", "qty": body["qty"],
+                "status": "held", "filled_qty": "0", "symbol": sym, "order_class": "oco",
+            }]
+        elif body.get("order_class") == "bracket":
+            # Bracket: parent is the entry. Both exits are legs, held until the entry fills.
             legs = [
-                {"id": oid + "-tp", "type": "limit", "qty": body["qty"], "status": "new",
-                 "filled_qty": "0", "symbol": sym, "side": "sell"},
-                {"id": oid + "-sl", "type": "stop", "qty": body["qty"], "status": "new",
-                 "filled_qty": "0", "symbol": sym, "side": "sell"},
+                {"id": oid + "-tp", "type": "limit", "side": "sell", "qty": body["qty"],
+                 "status": "held", "filled_qty": "0", "symbol": sym},
+                {"id": oid + "-sl", "type": "stop", "side": "sell", "qty": body["qty"],
+                 "status": "held", "filled_qty": "0", "symbol": sym},
             ]
+        elif side == "sell" and len(sym) <= 6 and self._working_sell(sym):
+            # Shares are held_for_orders while the OCO is accepted. The exit must cancel first.
+            status = "rejected"
         elif len(sym) > 10 and self.fill_marketable:
             status, filled, avg = "filled", str(int(qty)), limit
             self._apply_fill(sym, side, qty)
@@ -166,6 +188,8 @@ class MechFake:
 
     def cancel(self, oid):
         self.cancels.append(oid)
+        if not self.confirm_cancels:
+            return
         order = self.book.get(oid)
         if order and order["status"] != "filled":
             order["status"] = "canceled"
@@ -179,9 +203,14 @@ class MechFake:
     def option_snapshots(self, symbols):
         return {sym: self.snapshots[sym] for sym in symbols if sym in self.snapshots}
 
-    def option_contracts(self, underlying, start, end, kind):
-        return [c for c in self.contracts
+    def option_contracts(self, underlying, start, end, kind, strike_lte=None, strike_gte=None):
+        rows = [c for c in self.contracts
                 if c["underlying_symbol"] == underlying and c["type"] == kind and start <= c["expiration_date"] <= end]
+        if strike_lte is not None:
+            rows = [c for c in rows if float(c["strike_price"]) <= float(strike_lte) + 1e-9]
+        if strike_gte is not None:
+            rows = [c for c in rows if float(c["strike_price"]) + 1e-9 >= float(strike_gte)]
+        return rows
 
     def activities(self, *args, **kwargs):
         return list(self.activities_list)
@@ -227,6 +256,7 @@ def test_config_hash_unchanged_and_caps_are_mechanics_only():
     assert MC.STOCK_ENTRY_QTY == 1 and MC.STOCK_PARTIAL_QTY == 2
     assert MC.STOCK_MAX_NOTIONAL == 60
     assert MC.WHEEL_MAX_STRIKE == 30
+    assert MC.FAR_OTM_FRACTION == 0.90
     text = open(os.path.join(ROOT, "policy.json"), encoding="utf-8").read()
     assert "MECH_" not in text and MC.STOCK_SYMBOL not in json.load(open(os.path.join(ROOT, "policy.json")))["wheel"]["universe"]
 
@@ -244,6 +274,28 @@ def test_select_put_fits_cash_and_distance():
     tight = MT.select_put(puts, snaps, underlying="F", today=today, spot_bid=11, spot_ask=11,
                           cash=500, allowance=3, mode="far")
     assert tight is None
+    # 80% of 11 is 8.8, so a zero bid there used to empty the chain. 9 is still
+    # under 90% and is the nearest strike with a positive bid. 10.5 is past 90%.
+    relaxed = [
+        _contract("F", EXP, "P", 8),
+        _contract("F", EXP, "P", 9),
+        _contract("F", EXP, "P", 10.5),
+    ]
+    relaxed_snaps = {
+        relaxed[0]["symbol"]: _quote_for("x", 0, 0.05),
+        relaxed[1]["symbol"]: _quote_for("x", 0.20, 0.30),
+        relaxed[2]["symbol"]: _quote_for("x", 0.40, 0.50),
+    }
+    nearer = MT.select_put(relaxed, relaxed_snaps, underlying="F", today=today, spot_bid=11, spot_ask=11,
+                           cash=100000, allowance=3, mode="far")
+    assert nearer["strike"] == 9
+    _none, counts = MT._choose_put(relaxed, relaxed_snaps, underlying="F", today=today, spot_bid=11,
+                                   spot_ask=11, cash=100000, allowance=3, mode="far")
+    assert counts["listed"] == 3 and counts["dte"] == 3 and counts["strike"] == 2 and counts["bid"] == 1
+    empty, empty_counts = MT._choose_put(
+        [_contract("F", "2026-11-16", "P", 8), _contract("F", EXP, "P", 8), _contract("F", EXP, "P", 40)],
+        {}, underlying="F", today=today, spot_bid=11, spot_ask=11, cash=100000, allowance=3, mode="far")
+    assert empty is None and empty_counts == {"listed": 3, "dte": 2, "strike": 1, "bid": 0}
     call = MT.select_call(
         [_contract("F", EXP, "C", 12), _contract("F", EXP, "C", 11)],
         {_contract("F", EXP, "C", 12)["symbol"]: _quote_for("x", 0.3, 0.4),
@@ -287,6 +339,57 @@ def test_stock_suite_pass_marks_partial_mock_and_can_record(tmp_path, capsys):
     assert journal.db.execute("SELECT COUNT(*) n FROM equity_marks").fetchone()["n"] == 0
     assert main.db.execute("SELECT COUNT(*) n FROM equity_marks").fetchone()["n"] == 0
     assert "spy_benchmarks" not in open(MT.__file__, encoding="utf-8").read()
+    ocos = [order for order in fake.book.values() if order.get("order_class") == "oco"]
+    assert len(ocos) == 2
+    for order in ocos:
+        assert order["type"] == "limit" and order["side"] == "sell"
+        assert [leg["type"] for leg in order["legs"]] == ["stop"]
+        assert order["legs"][0]["side"] == "sell"
+
+
+def test_legs_live_accepts_alpaca_oco_parent_and_bracket_legs():
+    """Fake broker returns Alpaca's OCO shape and a bracket shape."""
+    fake = MechFake(_clock())
+    oco_body = C.protection_oco_body("F", 1, {"limit_price": "12.00"}, {"stop_price": "10.00"})
+    oco_body["client_order_id"] = "oco-shape"
+    parent = fake.submit(oco_body)
+    stored = fake.order(parent["id"])
+    assert stored["status"] == "new" and stored["type"] == "limit" and stored["side"] == "sell"
+    assert stored["order_class"] == "oco"
+    assert [leg["type"] for leg in stored["legs"]] == ["stop"]
+    assert stored["legs"][0]["status"] == "held"
+    assert MT._legs_live(stored)
+    # The old check looked only inside legs, so this live OCO would fail.
+    assert MT._legs_live({"id": "x", "type": "limit", "side": "buy", "status": "filled",
+                          "legs": stored["legs"]}) is False
+    bracket_body, _stop, _target = S.bracket_body("F", 1, 11.0, 0.5, {"target_r_mult": 3})
+    bracket_body["client_order_id"] = "bracket-shape"
+    bracket = fake.order(fake.submit(bracket_body)["id"])
+    assert bracket["order_class"] == "bracket" and bracket["side"] == "buy"
+    assert {leg["type"] for leg in bracket["legs"]} == {"limit", "stop"}
+    assert all(leg["status"] == "held" and leg["side"] == "sell" for leg in bracket["legs"])
+    assert MT._legs_live(bracket)
+    assert MT._legs_live({"legs": [bracket["legs"][0]]}) is False
+
+
+def test_strategy_exit_does_not_sell_until_oco_cancel_is_confirmed(tmp_path):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = MechFake(clock)
+    fake.confirm_cancels = False
+    fake.positions_list = [{"symbol": "F", "qty": "1", "side": "long", "asset_class": "us_equity"}]
+    body = C.protection_oco_body("F", 1, {"limit_price": "12.00"}, {"stop_price": "10.00"})
+    body["client_order_id"] = "oco-live"
+    parent = fake.submit(body)
+    om = OrderManager(journal, cfg, writer=fake, ledger=Ledger(journal, cfg.policy))
+    rows = []
+    MT._step_exit(cfg, journal, om, fake, fake, [{"id": parent["id"], "cid": body["client_order_id"]}],
+                  rows, "F", 1, 0, lambda _s: None)
+    assert rows[-1]["result"] == "FAIL"
+    assert "held_for_orders" in rows[-1]["note"]
+    assert [item for item in fake.submits if item.get("position_intent") == "sell_to_close"] == []
+    assert fake.order(parent["id"])["status"] == "new"
 
 
 def test_stock_partial_fill_is_broker_evidence_when_the_broker_partials(tmp_path, capsys):
@@ -382,6 +485,42 @@ def test_wheel_sell_buyback_records_on_pass(tmp_path, capsys):
     assert "wheel_sell_buyback" in gate
     assert journal.run_id in gate["wheel_sell_buyback"]["evidence"]
     assert "wheel_lifecycle" not in gate
+
+
+def test_wheel_sell_buyback_refusal_prints_filter_counts(tmp_path, capsys):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = MechFake(clock)
+    _arm_wheel(fake)
+    for snap in fake.snapshots.values():
+        snap["latestQuote"]["bp"] = 0
+    code = MT.run_wheel_sell_buyback(
+        cfg, journal, fake, fake, fake, root=str(tmp_path), expected_account_id="MECH-1",
+        record=True, **_run_kw(fake, clock))
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "no far-OTM weekly put" in out
+    assert "contracts listed 1, after DTE filter 1, after strike filter 1, with positive bid 0" in out
+    assert fake.submits == []
+
+
+def test_wheel_expiry_start_refusal_prints_filter_counts(tmp_path, capsys):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = MechFake(clock)
+    _arm_wheel(fake)
+    for snap in fake.snapshots.values():
+        snap["latestQuote"]["bp"] = 0
+    code = MT.run_wheel_expiry(
+        cfg, journal, fake, fake, fake, action="start", root=str(tmp_path),
+        expected_account_id="MECH-1", record=True, **_run_kw(fake, clock))
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "slightly-ITM" in out
+    assert "contracts listed 1, after DTE filter 1, after strike filter 1, with positive bid 0" in out
+    assert fake.submits == []
 
 
 def option_flat(fake, occ):

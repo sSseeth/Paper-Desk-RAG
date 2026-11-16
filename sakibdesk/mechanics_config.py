@@ -20,7 +20,10 @@ WHEEL_UNDERLYING = "F"
 WHEEL_CONTRACTS = 1
 WHEEL_MAX_STRIKE = 30.0
 
-FAR_OTM_FRACTION = 0.80
+# Nearest OTM strike at or below this fraction of the bid. Farther strikes on
+# a low-priced name often have a zero bid on the indicative feed, so the
+# mechanics selector stops at 90% of spot and keeps the first positive bid.
+FAR_OTM_FRACTION = 0.90
 ITM_FRACTION = 1.01
 MIN_DTE = 1
 SELL_BUYBACK_MAX_DTE = 21

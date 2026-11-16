@@ -21,6 +21,48 @@ def test_partial_fill_books_delta_once_and_reduces_reservation(cfg, journal, bro
     assert led.cash("STOCK") == 19000 and om.reserved("STOCK") == 0
 
 
+def test_oco_parent_limit_covers_the_target():
+    """Alpaca OCO: take-profit is the parent, and legs holds only the held stop."""
+    oco = {
+        "id": "parent", "order_class": "oco", "side": "sell", "type": "limit", "status": "new",
+        "qty": "4", "filled_qty": "0",
+        "legs": [{"id": "stop", "type": "stop", "side": "sell", "status": "held",
+                  "qty": "4", "filled_qty": "0"}],
+    }
+    assert S.protection_gap(4.0, oco["legs"])["ok"] is False
+    assert S.protection_gap(4.0, S.protection_orders(oco))["ok"]
+    bracket = {
+        "id": "entry", "order_class": "bracket", "side": "buy", "type": "limit", "status": "filled",
+        "qty": "4", "filled_qty": "4",
+        "legs": [
+            {"type": "limit", "side": "sell", "status": "held", "qty": "4", "filled_qty": "0"},
+            {"type": "stop", "side": "sell", "status": "held", "qty": "4", "filled_qty": "0"},
+        ],
+    }
+    assert S.parent_is_exit(bracket) is False
+    assert len(S.protection_orders(bracket)) == 2
+    assert S.protection_gap(4.0, S.protection_orders(bracket))["ok"]
+
+
+def test_reconcile_accepts_oco_shaped_protection(cfg, journal, broker):
+    om = OrderManager(journal, cfg, writer=broker, ledger=Ledger(journal, cfg.policy))
+    body, _stop, _tgt = S.bracket_body("MU", 10, 100.0, 4.0, cfg.policy["stock"])
+    placed = om.place(strategy="STOCK", symbol="MU", purpose="ENTRY", signal_key="s", body=body,
+                      reservations=[("STOCK", "ORDER_NOTIONAL", 1000.0)])
+    broker.fill(placed["client_order_id"], 4, 100, status="canceled")
+    broker.positions_list = [{"symbol": "MU", "qty": "4", "asset_class": "us_equity"}]
+    om.reconcile(ReaderView(broker))
+    stored = broker.order_by_client_id(placed["client_order_id"])
+    stored.update(order_class="oco", side="sell", type="limit", status="new", qty="4", filled_qty="0")
+    stored["legs"] = [{"id": "sl", "type": "stop", "side": "sell", "status": "held",
+                       "qty": "4", "filled_qty": "0"}]
+    before = len(broker.submits)
+    C.reconcile_stock(cfg, journal, om, ReaderView(broker), broker.positions_list, "2026-10-28",
+                      {"actions": [], "orders": []})
+    assert len(broker.submits) == before
+    assert broker.cancels == []
+
+
 def test_protection_gap_detects_uncovered_partial():
     legs = [{"type": "limit", "qty": "10", "status": "held"}, {"type": "stop", "qty": "10", "status": "held"}]
     g = S.protection_gap(4.0, legs)

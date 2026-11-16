@@ -90,7 +90,9 @@ class PaperReader:
         return self.http._req("GET", f"/v2/orders/{order_id}", {"nested": "true"})
 
     def order_by_client_id(self, cid):
-        return self.http._req("GET", "/v2/orders:by_client_order_id", {"client_order_id": cid})
+        # nested=true is required. Without it the bracket/OCO `legs` array is null.
+        return self.http._req("GET", "/v2/orders:by_client_order_id",
+                              {"client_order_id": cid, "nested": "true"})
 
     def orders(self, status="open"):
         """Paginate backwards by submitted time using `until` (max 500 per page)."""
@@ -106,18 +108,31 @@ class PaperReader:
                 return out
             until = page[-1]["submitted_at"]
 
-    def option_contracts(self, underlying, exp_gte, exp_lte, typ):
-        out, tok = [], None
+    def option_contracts(self, underlying, exp_gte, exp_lte, typ, strike_lte=None, strike_gte=None):
+        """Active contracts in the expiry window.
+
+        The route defaults to limit 100 and to expirations before the next
+        weekend, and it pages with `next_page_token`. Both dates, `type`, and
+        `status=active` are always sent. Optional strike bounds keep a later
+        page from being the only place a low or near strike appears.
+        """
+        out, tok, seen = [], None, set()
         while True:
-            p = {"underlying_symbols": underlying, "expiration_date_gte": exp_gte, "expiration_date_lte": exp_lte,
-                 "type": typ, "status": "active", "limit": 1000}
+            p = {"underlying_symbols": underlying, "expiration_date_gte": exp_gte,
+                 "expiration_date_lte": exp_lte, "type": typ, "status": "active", "limit": 1000}
+            if strike_lte is not None:
+                p["strike_price_lte"] = strike_lte
+            if strike_gte is not None:
+                p["strike_price_gte"] = strike_gte
             if tok:
                 p["page_token"] = tok
             r = self.http._req("GET", "/v2/options/contracts", p) or {}
-            out += r.get("option_contracts", [])
-            tok = r.get("next_page_token") or r.get("page_token")
-            if not tok:
+            out += r.get("option_contracts") or []
+            nxt = r.get("next_page_token") or r.get("page_token")
+            if not nxt or nxt == tok or nxt in seen:
                 return out
+            seen.add(nxt)
+            tok = nxt
 
     def activities(self, types=("OPASN", "OPEXP", "OPXRC", "OPTRD", "FILL"), after=None):
         out, tok = [], None
@@ -169,16 +184,26 @@ class MarketData:
         return (r or {}).get("quotes", {})
 
     def option_snapshots(self, symbols):
+        """Latest quote, trade, and greeks. `symbols` is capped at 100 per request.
+
+        The response `limit` counts data points, not symbols, and defaults to
+        100, so a full batch asks for the maximum page (1000) and follows
+        `next_page_token`. `feed` is the profile feed (`indicative` on the
+        free profile); the route would otherwise default toward OPRA.
+        """
         out = {}
         for i in range(0, len(symbols), 100):
-            tok = None
-            while True:
-                p = {"symbols": ",".join(symbols[i:i + 100]), "feed": self.option_feed}
+            batch = list(symbols[i:i + 100])
+            tok, seen = None, set()
+            while batch:
+                p = {"symbols": ",".join(batch), "feed": self.option_feed, "limit": 1000}
                 if tok:
                     p["page_token"] = tok
                 r = self.http._req("GET", "/v1beta1/options/snapshots", p) or {}
                 out.update(r.get("snapshots") or {})
-                tok = r.get("next_page_token")
-                if not tok:
+                nxt = r.get("next_page_token")
+                if not nxt or nxt == tok or nxt in seen:
                     break
+                seen.add(nxt)
+                tok = nxt
         return out
