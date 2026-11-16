@@ -35,7 +35,14 @@ def _blocked(summary, why):
     summary["entry_blocks"].append(why)
 
 
-def run_cycle(cfg, journal, mode, deps, root):
+def run_cycle(cfg, journal, mode, deps, root, entry_policy=None):
+    """One cycle. `entry_policy` is set only for main-account AUTO_PAPER.
+
+    None leaves both books on the existing rules. A policy object may block
+    wheel entries and label the wheel book PROVISIONAL. Stock entries are not
+    blocked here; the caller refuses the whole cycle when stock_lifecycle is
+    missing.
+    """
     if mode not in MODES:
         raise ValueError("mode must be DRY_RUN or AUTO_PAPER")
     if mode == "DRY_RUN" and deps.writer is not None:
@@ -47,6 +54,16 @@ def run_cycle(cfg, journal, mode, deps, root):
     summary = {"mode": mode, "utc": iso(now), "entry_blocks": [], "actions": [], "orders": [], "no_trade": True,
                "feed_profile": cfg.feed_profile, "option_quotes": p["data_settings"][cfg.feed_profile]["option_quotes_label"]}
     journal.event("CYCLE_START", {"mode": mode})
+    if entry_policy is not None:
+        summary["wheel_lifecycle_label"] = entry_policy.label
+        if entry_policy.provisional:
+            journal.event("WHEEL_LIFECYCLE_PROVISIONAL", {
+                "label": "PROVISIONAL",
+                "detail": "wheel_sell_buyback is recorded and mock wheel tests passed; "
+                          "expiry and assignment are not fully verified",
+            })
+        if not entry_policy.wheel_entries:
+            journal.event("WHEEL_ENTRIES_BLOCKED", {"reason": entry_policy.reason, "label": entry_policy.label})
     risk = RiskState(journal, p)
 
     # schema pin (startup check repeated each cycle)
@@ -130,7 +147,10 @@ def run_cycle(cfg, journal, mode, deps, root):
     if not summary["entry_blocks"]:
         try:
             stock_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records, summary)
-            wheel_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records, summary)
+            if entry_policy is not None and not entry_policy.wheel_entries:
+                summary["wheel"] = "WHEEL_ENTRIES_BLOCKED: " + entry_policy.reason
+            else:
+                wheel_entries(cfg, journal, om, ledger, deps, cal, sess, today, now, records, summary)
         except (BrokerError, FeedNotEntitled) as e:
             journal.event("ENTRY_DATA_ERROR", {"error": str(e)})
             _blocked(summary, "DATA_OUTAGE")
@@ -193,10 +213,23 @@ def fix_protection(cfg, journal, om, reader, it, o, gap, summary):
                 return
     body = json.loads(it["body"])
     res = om.place(strategy="STOCK", symbol=it["symbol"], purpose="PROTECT_OCO", signal_key=it["client_order_id"],
-                   body={"symbol": it["symbol"], "qty": str(int(gap["filled"])), "side": "sell", "type": "limit",
-                         "time_in_force": "gtc", "order_class": "oco",
-                         "take_profit": body["take_profit"], "stop_loss": body["stop_loss"]}, reservations=[])
+                   body=protection_oco_body(it["symbol"], gap["filled"], body["take_profit"], body["stop_loss"]),
+                   reservations=[])
     summary["orders"].append(res)
+
+
+def protection_oco_body(symbol, qty, take_profit, stop_loss):
+    """OCO stop and target for the filled shares. Same shape the bracket legs use."""
+    return {"symbol": symbol, "qty": str(int(qty)), "side": "sell", "type": "limit",
+            "time_in_force": "gtc", "order_class": "oco",
+            "take_profit": take_profit, "stop_loss": stop_loss}
+
+
+def strategy_exit_body(symbol, qty, bid):
+    """Limit sell at the fresh bid. This is the strategy-exit order."""
+    return {"symbol": symbol, "qty": str(int(qty)), "side": "sell", "type": "limit",
+            "time_in_force": "day", "limit_price": str(S.round_px(float(bid))),
+            "position_intent": "sell_to_close"}
 
 
 def reprice_exits(cfg, journal, om, deps, now, summary):
@@ -262,9 +295,7 @@ def manage_stock_exits(cfg, journal, om, deps, positions, cal, sess, today, summ
                     journal.event("EXIT_NO_FRESH_QUOTE", {}, "STOCK", sym); continue
                 qty = int(float(held[sym]["qty"]))
                 res = om.place(strategy="STOCK", symbol=sym, purpose="STRATEGY_EXIT", signal_key=f"{today}:{why}",
-                               body={"symbol": sym, "qty": str(qty), "side": "sell", "type": "limit",
-                                     "time_in_force": "day", "limit_price": str(S.round_px(float(q["bp"]))),
-                                     "position_intent": "sell_to_close"}, reservations=[])
+                               body=strategy_exit_body(sym, qty, q["bp"]), reservations=[])
                 summary["orders"].append(res)
                 journal.set(f"stock_exit_session:{sym}", today)
 
@@ -633,9 +664,8 @@ def manage_wheel(cfg, journal, om, deps, cal, sess, today, now, records, summary
             if a == "BUY_TO_CLOSE" and c["state"] in ("PUT_OPEN", "CALL_OPEN") and oa:
                 res = om.place(strategy="WHEEL", symbol=d["option_symbol"], purpose="BUY_TO_CLOSE",
                                signal_key=f"{c['cycle_id']}:{today}:{why}",
-                               body={"symbol": d["option_symbol"], "qty": "1", "side": "buy", "type": "limit",
-                                     "time_in_force": "day", "limit_price": str(W.tick_round_up(float(oa))),
-                                     "position_intent": "buy_to_close"}, reservations=[])
+                               body=W.option_order_body(d["option_symbol"], "buy", W.tick_round_up(float(oa)),
+                                                        "buy_to_close"), reservations=[])
                 summary["orders"].append(res)
                 if res["status"] not in ("BLOCKED", "DUPLICATE", "DRY_RUN"):
                     set_state(journal, c, "BUYBACK_SUBMITTED", pending_cid=res["client_order_id"])
@@ -732,8 +762,7 @@ def _sell_option(cfg, journal, om, deps, cal, today, now, sym, rec, kind, cyc, b
             return _cash_ok(db, om.ledger, "WHEEL", need)
         cid_res = om.place(strategy="WHEEL", symbol=best["symbol"], purpose="SELL_PUT_OPEN",
                            signal_key=f"{today}:{best['symbol']}", cash_check=check,
-                           body={"symbol": best["symbol"], "qty": "1", "side": "sell", "type": "limit",
-                                 "time_in_force": "day", "limit_price": f"{limit:.2f}", "position_intent": "sell_to_open"},
+                           body=W.option_order_body(best["symbol"], "sell", limit, "sell_to_open"),
                            reservations=[("WHEEL", "PUT_COLLATERAL", need, sym)])
     else:
         def check(db):
@@ -743,8 +772,7 @@ def _sell_option(cfg, journal, om, deps, cal, today, now, sym, rec, kind, cyc, b
             return (shares - held >= 100, "share coverage: <100 free shares")
         cid_res = om.place(strategy="WHEEL", symbol=best["symbol"], purpose="SELL_CALL_OPEN",
                            signal_key=f"{today}:{best['symbol']}", cash_check=check,
-                           body={"symbol": best["symbol"], "qty": "1", "side": "sell", "type": "limit",
-                                 "time_in_force": "day", "limit_price": f"{limit:.2f}", "position_intent": "sell_to_open"},
+                           body=W.option_order_body(best["symbol"], "sell", limit, "sell_to_open"),
                            reservations=[("WHEEL", "CALL_SHARES", 100, sym)])
     cid_res.update({"underlying": sym, "contract": best})
     summary["orders"].append(cid_res)
