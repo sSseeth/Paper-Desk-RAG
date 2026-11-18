@@ -259,7 +259,10 @@ def test_config_hash_unchanged_and_caps_are_mechanics_only():
     assert MC.FAR_OTM_FRACTION == 0.90
     # The indicative walk is mechanics-only. It is not part of the config hash.
     assert MC.SELL_PUT_FLOOR == 0.01
+    assert MC.MIN_SELLABLE_BID == 0.05
     assert MC.BUYBACK_MAX_PRICE == 0.25
+    assert MC.BUYBACK_EXTRA_OVER_SOLD == 0.25
+    assert MC.BUYBACK_ABS_MAX == 1.00
     assert MC.PRICE_WALK_ATTEMPTS == 30
     assert MC.PRICE_WALK_INTERVAL_SEC == 1.0
     assert MC.PRICE_WALK_MAX_STEPS == 3
@@ -283,8 +286,9 @@ def test_select_put_fits_cash_and_distance():
     tight = MT.select_put(puts, snaps, underlying="F", today=today, spot_bid=11, spot_ask=11,
                           cash=500, allowance=3, mode="far")
     assert tight is None
-    # 80% of 11 is 8.8, so a zero bid there used to empty the chain. 9 is still
-    # under 90% and is the nearest strike with a positive bid. 10.5 is past 90%.
+    # 9 is at or below 90% of 11 and is sellable, so far wins over 10.5.
+    # 10.5 is above 90% and still below the spot bid, so it stays in the
+    # chain for the fallback and is counted.
     relaxed = [
         _contract("F", EXP, "P", 8),
         _contract("F", EXP, "P", 9),
@@ -297,14 +301,14 @@ def test_select_put_fits_cash_and_distance():
     }
     nearer = MT.select_put(relaxed, relaxed_snaps, underlying="F", today=today, spot_bid=11, spot_ask=11,
                            cash=100000, allowance=3, mode="far")
-    assert nearer["strike"] == 9
+    assert nearer["strike"] == 9 and nearer["rule"] == "far"
     _none, counts = MT._choose_put(relaxed, relaxed_snaps, underlying="F", today=today, spot_bid=11,
                                    spot_ask=11, cash=100000, allowance=3, mode="far")
-    assert counts["listed"] == 3 and counts["dte"] == 3 and counts["strike"] == 2 and counts["bid"] == 1
+    assert counts == {"listed": 3, "dte": 3, "strike": 3, "bid": 2, "sellable": 2}
     empty, empty_counts = MT._choose_put(
         [_contract("F", "2026-11-16", "P", 8), _contract("F", EXP, "P", 8), _contract("F", EXP, "P", 40)],
         {}, underlying="F", today=today, spot_bid=11, spot_ask=11, cash=100000, allowance=3, mode="far")
-    assert empty is None and empty_counts == {"listed": 3, "dte": 2, "strike": 1, "bid": 0}
+    assert empty is None and empty_counts == {"listed": 3, "dte": 2, "strike": 1, "bid": 0, "sellable": 0}
     call = MT.select_call(
         [_contract("F", EXP, "C", 12), _contract("F", EXP, "C", 11)],
         {_contract("F", EXP, "C", 12)["symbol"]: _quote_for("x", 0.3, 0.4),
@@ -489,6 +493,7 @@ def test_wheel_sell_buyback_records_on_pass(tmp_path, capsys):
     assert code == 0, out
     assert "RESULT: PASS" in out
     occ = _occ("F", EXP, "P", 8)
+    assert f"chosen far put {occ} strike 8.00 bid 0.40 (72.7% of spot 11.00)" in out
     assert option_flat(fake, occ)
     gate = json.loads(open(LG.gate_path(str(tmp_path)), encoding="utf-8").read())
     assert "wheel_sell_buyback" in gate
@@ -511,7 +516,113 @@ def test_wheel_sell_buyback_refusal_prints_filter_counts(tmp_path, capsys):
     assert code == 2
     assert "no far-OTM weekly put" in out
     assert "contracts listed 1, after DTE filter 1, after strike filter 1, with positive bid 0" in out
+    assert "sellable bid (>= 1 tick after rounding) 0" in out
     assert fake.submits == []
+
+
+def _puts(exp, quotes):
+    """Put contracts and snapshots. ``quotes`` maps strike to (bid, ask)."""
+    contracts = [_contract("F", exp, "P", strike) for strike in quotes]
+    snaps = {}
+    for contract in contracts:
+        strike = float(contract["strike_price"])
+        bid, ask = quotes[strike]
+        snaps[contract["symbol"]] = _quote_for(contract["symbol"], bid, ask)
+    return contracts, snaps
+
+
+def _choose(contracts, snaps, *, spot=11, cash=100000, mode="far", today=None):
+    today = today or date(2026, 11, 16)
+    return MT._choose_put(
+        contracts, snaps, underlying="F", today=today, spot_bid=spot, spot_ask=spot,
+        cash=cash, allowance=3, mode=mode)
+
+
+def test_subnickel_far_bid_falls_back_to_the_lowest_nearer_otm():
+    quotes = {8: (0.04, 0.10), 9: (0.049, 0.10), 10: (0.20, 0.30), 10.5: (0.60, 0.70)}
+    contracts, snaps = _puts(EXP, quotes)
+    chosen, counts = _choose(contracts, snaps)
+    assert chosen["strike"] == 10 and chosen["rule"] == "fallback"
+    assert chosen["bid"] == 0.20
+    assert counts["bid"] == 4 and counts["sellable"] == 2
+    assert MT._put_choice_line(chosen, 11) == (
+        f"chosen fallback put {chosen['symbol']} strike 10.00 bid 0.20 (90.9% of spot 11.00)")
+    # A bid that rounds down to one nickel is sellable, so the far strike wins.
+    quotes[9] = (0.09, 0.15)
+    contracts, snaps = _puts(EXP, quotes)
+    chosen, _counts = _choose(contracts, snaps)
+    assert chosen["strike"] == 9 and chosen["rule"] == "far"
+
+
+def test_sellable_far_strike_is_preferred_over_a_richer_nearer_put():
+    quotes = {8: (0.10, 0.20), 9: (0.15, 0.25), 10: (0.80, 0.90)}
+    chosen, counts = _choose(*_puts(EXP, quotes))
+    assert chosen["strike"] == 9 and chosen["rule"] == "far"
+    assert chosen["bid"] == 0.15
+    assert counts["sellable"] == 3
+    assert "81.8% of spot" in MT._put_choice_line(chosen, 11)
+
+
+def test_nothing_sellable_refuses_and_separates_positive_from_sellable():
+    quotes = {8: (0.04, 0.10), 9: (0.02, 0.10), 10: (0.03, 0.10)}
+    chosen, counts = _choose(*_puts(EXP, quotes))
+    assert chosen is None
+    assert counts == {"listed": 3, "dte": 3, "strike": 3, "bid": 3, "sellable": 0}
+    line = MT._filter_summary(counts)
+    assert "with positive bid 3, sellable bid (>= 1 tick after rounding) 0" in line
+
+
+def test_far_mode_never_chooses_a_strike_at_or_above_spot():
+    quotes = {8: (0.01, 0.05), 11: (1.00, 1.10), 12: (1.20, 1.30)}
+    chosen, counts = _choose(*_puts(EXP, quotes))
+    assert chosen is None
+    assert counts["strike"] == 1 and counts["bid"] == 1 and counts["sellable"] == 0
+    quotes = {10.5: (0.40, 0.50), 11: (1.00, 1.10)}
+    chosen, counts = _choose(*_puts(EXP, quotes))
+    assert chosen["strike"] == 10.5 and chosen["rule"] == "fallback"
+    assert chosen["strike"] < 11
+    assert counts["strike"] == 1 and counts["sellable"] == 1
+
+
+def test_far_mode_uses_the_next_expiry_only_when_the_near_one_has_no_sellable_bid():
+    today = date(2026, 11, 16)
+    near, later, too_far = "2026-11-20", "2026-11-27", "2026-12-18"
+    quotes = {
+        (near, 9): (0.04, 0.10),
+        (later, 8): (0.25, 0.35),
+        (too_far, 8): (0.90, 1.00),
+    }
+    contracts, snaps = _puts_by_expiry(quotes)
+    chosen, counts = _choose(contracts, snaps, today=today)
+    assert chosen["expiry"] == later and chosen["strike"] == 8 and chosen["rule"] == "far"
+    assert counts["dte"] == 2 and counts["sellable"] == 1
+    # A sellable fallback on the near expiry stops the search.
+    quotes[(near, 10)] = (0.30, 0.40)
+    contracts, snaps = _puts_by_expiry(quotes)
+    chosen, _counts = _choose(contracts, snaps, today=today)
+    assert chosen["expiry"] == near and chosen["strike"] == 10 and chosen["rule"] == "fallback"
+
+
+def test_fallback_still_respects_cash_and_the_strike_cap():
+    quotes = {8: (0.04, 0.10), 10: (0.40, 0.50), 40: (1.00, 1.10)}
+    chosen, counts = _choose(*_puts(EXP, quotes), cash=900)
+    assert chosen is None
+    assert counts["strike"] == 1 and counts["sellable"] == 0
+    quotes[8] = (0.20, 0.30)
+    chosen, counts = _choose(*_puts(EXP, quotes), cash=1000)
+    assert chosen["strike"] == 8 and chosen["rule"] == "far"
+    assert counts["sellable"] == 1
+
+
+def _puts_by_expiry(quotes):
+    """``quotes`` maps (expiry, strike) to (bid, ask)."""
+    contracts = []
+    snaps = {}
+    for (exp, strike), (bid, ask) in quotes.items():
+        contract = _contract("F", exp, "P", strike)
+        contracts.append(contract)
+        snaps[contract["symbol"]] = _quote_for(contract["symbol"], bid, ask)
+    return contracts, snaps
 
 
 class WalkBroker(MechFake):
@@ -738,14 +849,19 @@ def test_buyback_walk_stops_at_cap(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 2, out
     assert "RESULT: FAIL" in out
-    assert "price walk buyback: 0.05 -> 0.10 -> 0.25" in out
-    assert "price walk buy_to_close: 0.05 -> 0.10 -> 0.25" in out
+    # The sell filled at 0.40, so the cap is 0.40 + 0.25, still under the absolute max.
+    cap = MT._buyback_cap(0.40)
+    assert cap == 0.65
+    ladder = f"0.05 -> 0.10 -> {cap:.2f}"
+    assert f"price walk buyback: {ladder}" in out
+    assert f"price walk buy_to_close: {ladder}" in out
     buys = [float(px) for px in _limits(fake, "buy_to_close")]
-    assert buys == [0.05, 0.10, 0.25, 0.05, 0.10, 0.25]
-    assert max(buys) == MC.BUYBACK_MAX_PRICE
+    assert buys == [0.05, 0.10, cap, 0.05, 0.10, cap]
+    assert max(buys) == cap
+    assert max(buys) <= MC.BUYBACK_ABS_MAX
     step = _mech_step(journal, "buyback")
     assert step["result"] == "FAIL"
-    assert step["evidence"] == "BROKER limit=0.25 status=canceled reprices=2"
+    assert step["evidence"] == f"BROKER limit={cap:.2f} status=canceled reprices=2"
     assert "SHORT PUT STILL OPEN" in out
     assert occ in out
     assert all(n == 0 for n in fake.working_at_submit)
@@ -757,6 +873,125 @@ def test_buyback_walk_stops_at_cap(tmp_path, capsys):
     assert any(pos.get("symbol") == occ and pos.get("side") == "short" for pos in state["positions"])
     assert not os.path.exists(LG.gate_path(str(tmp_path)))
     assert slept == [MC.PRICE_WALK_INTERVAL_SEC] * ((MC.PRICE_WALK_ATTEMPTS - 1) * 6)
+
+
+def test_buyback_cap_math_and_config_hash():
+    assert Config(ROOT).config_hash == "2df03f83726ac139"
+    assert MT._buyback_cap(None) == MC.BUYBACK_MAX_PRICE
+    assert MT._buyback_cap(0) == MC.BUYBACK_MAX_PRICE
+    assert MT._buyback_cap(-1) == MC.BUYBACK_MAX_PRICE
+    assert MT._buyback_cap("nope") == MC.BUYBACK_MAX_PRICE
+    assert MT._buyback_cap(0.01) == 0.26
+    assert MT._buyback_cap(0.40) == 0.65
+    assert MT._buyback_cap(0.55) == 0.80
+    assert MT._buyback_cap(0.75) == 1.00
+    assert MT._buyback_cap(0.90) == MC.BUYBACK_ABS_MAX
+    assert MT._buy_price_walk(0.05) == [0.05, 0.10, 0.25]
+    assert MT._buy_price_walk(0.05, 0.40) == [0.05, 0.10, 0.65]
+    assert MT._buy_price_walk(0.05, 0.55) == [0.05, 0.10, 0.80]
+    assert MT._buy_price_walk(0.05, 0.90) == [0.05, 0.10, 1.00]
+    assert MT._buy_price_walk(0.90, 0.40) == [0.65]
+    assert MT._clamp_walk_price("buy", 0.80, 0.65) == 0.65
+    assert MT._clamp_walk_price("buy", 0.10, 0.65) == 0.10
+    assert MT._clamp_walk_price("buy", 1.50, None) == MC.BUYBACK_MAX_PRICE
+    for sold in (None, 0, 0.01, 0.05, 0.20, 0.40, 0.55, 0.75, 0.90, 2):
+        cap = MT._buyback_cap(sold)
+        assert MC.BUYBACK_MAX_PRICE - 1e-9 <= cap <= MC.BUYBACK_ABS_MAX + 1e-9
+        for ask in (0.01, 0.05, 0.20, 0.50, 0.90, 1.50):
+            steps = MT._buy_price_walk(ask, sold)
+            assert 1 <= len(steps) <= MC.PRICE_WALK_MAX_STEPS
+            assert steps == sorted(steps)
+            assert max(steps) <= cap + 1e-9
+    # One contract bought at the absolute cap, after a floor-priced sell, is under $100.
+    loss = (MC.BUYBACK_ABS_MAX - MC.SELL_PUT_FLOOR) * 100 * MC.WHEEL_CONTRACTS
+    assert loss < 100
+
+
+class ReportedAvgBroker(WalkBroker):
+    """Opening sell reports this filled average, which is not the limit."""
+
+    def __init__(self, clock, avg):
+        super().__init__(clock)
+        self.reported_avg = f"{float(avg):.2f}"
+
+    def submit(self, body):
+        order = super().submit(body)
+        stored = self.book.get(order["id"])
+        if (stored and stored.get("side") == "sell" and stored.get("status") == "filled"
+                and len(stored.get("symbol") or "") > 10):
+            stored["filled_avg_price"] = self.reported_avg
+            return dict(stored)
+        return order
+
+
+def test_buyback_cap_uses_the_broker_filled_average(tmp_path, capsys):
+    clock = _clock()
+    fake = ReportedAvgBroker(clock, 0.55)
+    _arm_wheel(fake)
+    occ = _occ("F", EXP, "P", 8)
+    fake.snapshots[occ]["latestQuote"]["bp"] = 0.40
+    fake.snapshots[occ]["latestQuote"]["ap"] = 0.05
+    fake.sell_fill_at = 100.0
+    _journal, code = _run_walk(tmp_path, fake, clock, lambda _s: None)
+    out = capsys.readouterr().out
+    assert code == 2, out
+    # 0.55 + 0.25 = 0.80. The 0.40 limit would have capped the walk at 0.65.
+    cap = MT._buyback_cap(0.55)
+    assert cap == 0.80
+    ladder = f"0.05 -> 0.10 -> {cap:.2f}"
+    assert f"price walk buyback: {ladder}" in out
+    assert f"price walk buy_to_close: {ladder}" in out
+    buys = [float(px) for px in _limits(fake, "buy_to_close")]
+    assert buys == [0.05, 0.10, cap, 0.05, 0.10, cap]
+    assert max(buys) <= MC.BUYBACK_ABS_MAX
+    assert all(n == 0 for n in fake.working_at_submit)
+    assert fake.max_option_qty == 1
+
+
+def test_suite_falls_back_and_lists_every_otm_strike(tmp_path, capsys):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = MechFake(clock)
+    quotes = {8: (0.04, 0.10), 9: (0.03, 0.10), 10: (0.30, 0.40), 10.5: (0.70, 0.80), 11: (1.00, 1.10)}
+    fake.contracts, fake.snapshots = _puts(EXP, quotes)
+    seen = []
+    orig = fake.option_contracts
+
+    def wrapped(underlying, start, end, kind, strike_lte=None, strike_gte=None):
+        seen.append(strike_lte)
+        return orig(underlying, start, end, kind, strike_lte=strike_lte, strike_gte=strike_gte)
+
+    fake.option_contracts = wrapped
+    code = MT.run_wheel_sell_buyback(
+        cfg, journal, fake, fake, fake, root=str(tmp_path), expected_account_id="MECH-1",
+        record=True, **_run_kw(fake, clock))
+    out = capsys.readouterr().out
+    occ = _occ("F", EXP, "P", 10)
+    assert code == 0, out
+    assert seen == [min(MC.WHEEL_MAX_STRIKE, 11.0)]
+    assert f"chosen fallback put {occ} strike 10.00 bid 0.30 (90.9% of spot 11.00)" in out
+    sold = [body["symbol"] for body in fake.submits if body.get("position_intent") == "sell_to_open"]
+    assert sold == [occ]
+    assert _occ("F", EXP, "P", 11) not in {body["symbol"] for body in fake.submits}
+    assert option_flat(fake, occ)
+
+
+def test_suite_refuses_a_chain_whose_bids_round_below_one_tick(tmp_path, capsys):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = MechFake(clock)
+    quotes = {8: (0.04, 0.10), 9: (0.02, 0.10), 10: (0.0, 0.10), 11: (0.80, 0.90)}
+    fake.contracts, fake.snapshots = _puts(EXP, quotes)
+    code = MT.run_wheel_sell_buyback(
+        cfg, journal, fake, fake, fake, root=str(tmp_path), expected_account_id="MECH-1",
+        record=True, **_run_kw(fake, clock))
+    out = capsys.readouterr().out
+    assert code == 2
+    assert ("contracts listed 4, after DTE filter 4, after strike filter 3, "
+            "with positive bid 2, sellable bid (>= 1 tick after rounding) 0") in out
+    assert fake.submits == []
 
 
 def test_wheel_expiry_start_refusal_prints_filter_counts(tmp_path, capsys):
@@ -774,6 +1009,7 @@ def test_wheel_expiry_start_refusal_prints_filter_counts(tmp_path, capsys):
     assert code == 2
     assert "slightly-ITM" in out
     assert "contracts listed 1, after DTE filter 1, after strike filter 1, with positive bid 0" in out
+    assert "sellable bid (>= 1 tick after rounding) 0" in out
     assert fake.submits == []
 
 

@@ -740,21 +740,58 @@ def _cash(reader):
 def _filter_summary(counts):
     """One line an operator can match to the stage that emptied the chain."""
     return ("contracts listed {listed}, after DTE filter {dte}, "
-            "after strike filter {strike}, with positive bid {bid}").format(**counts)
+            "after strike filter {strike}, with positive bid {bid}, "
+            "sellable bid (>= 1 tick after rounding) {sellable}").format(**counts)
+
+
+def _put_choice_line(chosen, spot_bid):
+    """Rule, strike, bid, and the strike as a percent of the spot bid."""
+    spot = float(spot_bid)
+    pct = chosen["strike"] / spot * 100.0
+    return (f"chosen {chosen['rule']} put {chosen['symbol']} "
+            f"strike {chosen['strike']:.2f} bid {chosen['bid']:.2f} "
+            f"({pct:.1f}% of spot {spot:.2f})")
+
+
+def _pick_far_put(cands, far_line):
+    """Highest far strike, or the lowest sellable strike above that line.
+
+    ``cands`` are strictly OTM, fit the cash and strike caps, and have a
+    tick-rounded bid of at least one nickel, all on one expiry. Far means a
+    strike at or below ``far_line``. The fallback is the furthest-OTM
+    sellable strike that is still above the line.
+    """
+    far = [item for item in cands if item["strike"] <= far_line + 1e-9]
+    if far:
+        chosen = max(far, key=lambda item: (item["strike"], item["symbol"]))
+        rule = "far"
+    else:
+        chosen = min(cands, key=lambda item: (item["strike"], item["symbol"]))
+        rule = "fallback"
+    picked = dict(chosen)
+    picked["rule"] = rule
+    return picked
 
 
 def _choose_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash, allowance, mode):
     """Return `(chosen or None, counts)` for a far or slightly-ITM put.
 
-    `far` is the highest strike at or below `FAR_OTM_FRACTION` of the bid on
-    the nearest expiry that has a positive, sellable bid. `itm` is the lowest
-    strike at or above 101% of the ask. Strikes above the mechanics cap, or
-    whose strike*100+allowance exceeds cash, are skipped. Counts are the
-    contracts that survived each stage, so a refusal says which filter was empty.
+    `far` prefers, on the nearest expiry that has a sellable candidate, the
+    highest strike at or below `FAR_OTM_FRACTION` of the bid whose
+    tick-rounded bid is at least `MIN_SELLABLE_BID`. When that expiry has
+    none there, it takes the lowest strike above the fraction that is still
+    strictly below the spot bid. A later expiry is used only when the nearer
+    one has no sellable candidate, and only inside `SELL_BUYBACK_MAX_DTE`.
+    `itm` is the lowest strike at or above 101% of the ask. Strikes above
+    the mechanics cap, or whose strike*100+allowance exceeds cash, are
+    skipped. Counts are the contracts that survived each stage, so a refusal
+    says which filter was empty. A positive bid that rounds below one tick
+    is counted in `bid` and left out of `sellable`.
     """
-    counts = {"listed": len(contracts or []), "dte": 0, "strike": 0, "bid": 0}
+    counts = {"listed": len(contracts or []), "dte": 0, "strike": 0, "bid": 0, "sellable": 0}
     by_exp = {}
     max_dte = MC.SELL_BUYBACK_MAX_DTE if mode == "far" else MC.EXPIRY_MAX_DTE
+    far_line = float(spot_bid) * MC.FAR_OTM_FRACTION
     for contract in contracts or []:
         if contract.get("type") != "put":
             continue
@@ -777,7 +814,9 @@ def _choose_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash
         need = strike * 100 + allowance
         if need > cash:
             continue
-        if mode == "far" and strike > float(spot_bid) * MC.FAR_OTM_FRACTION:
+        # Far mode sells OTM premium only. A strike at the spot bid is not
+        # below the market, so it is out even when the chain request included it.
+        if mode == "far" and strike + 1e-9 >= float(spot_bid):
             continue
         if mode == "itm" and strike + 1e-9 < float(spot_ask) * MC.ITM_FRACTION:
             continue
@@ -789,8 +828,9 @@ def _choose_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash
             bid = 0.0
         if bid > 0:
             counts["bid"] += 1
-        if bid <= 0 or W.tick_round_down(bid) <= 0:
+        if W.tick_round_down(bid) < MC.MIN_SELLABLE_BID:
             continue
+        counts["sellable"] += 1
         by_exp.setdefault(exp, []).append({
             "symbol": contract["symbol"], "strike": strike, "expiry": exp, "dte": dte,
             "bid": bid, "need": need,
@@ -798,7 +838,7 @@ def _choose_put(contracts, snaps, *, underlying, today, spot_bid, spot_ask, cash
     for exp in sorted(by_exp):
         cands = by_exp[exp]
         if mode == "far":
-            return max(cands, key=lambda item: (item["strike"], item["symbol"])), counts
+            return _pick_far_put(cands, far_line), counts
         return min(cands, key=lambda item: (item["strike"], item["symbol"])), counts
     return None, counts
 
@@ -913,14 +953,26 @@ def _sync_wheel(journal, om, ledger, reader):
     return positions, activities
 
 
+def _otm_strike_cap(spot_bid):
+    """Highest strike the OTM chain request may include.
+
+    ``option_contracts`` follows ``next_page_token`` until the bounded chain
+    is complete, so a short page cannot hide a lower strike. The bound is
+    the spot bid and also the mechanics strike cap. The chooser drops a
+    strike that is not strictly below the bid.
+    """
+    return min(float(MC.WHEEL_MAX_STRIKE), float(spot_bid))
+
+
 def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_account_id, record=True,
                            attempts=MC.PRICE_WALK_ATTEMPTS, interval=MC.PRICE_WALK_INTERVAL_SEC,
                            sleep=time.sleep):
-    """Sell one far-OTM cash-secured put and buy it back. Records on PASS.
+    """Sell one OTM cash-secured put and buy it back. Records on PASS.
 
-    The option walk polls ``MC.PRICE_WALK_ATTEMPTS`` times at
-    ``MC.PRICE_WALK_INTERVAL_SEC``. ``attempts`` and ``interval`` stay in the
-    signature so existing callers keep working; they do not shorten that walk.
+    Far OTM is preferred. A nearer OTM put is sold when the far strikes have
+    no sellable bid. The option walk polls ``MC.PRICE_WALK_ATTEMPTS`` times
+    at ``MC.PRICE_WALK_INTERVAL_SEC``. ``attempts`` and ``interval`` stay in
+    the signature so existing callers keep working; they do not shorten that walk.
     """
     why = _preflight(reader, writer, expected_account_id)
     if why:
@@ -945,16 +997,16 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
         print("Refused: mechanics cash is unreadable. Nothing was sent.")
         return 2
     today = _session_date(reader, journal)
-    # Cap the chain at the far strike so a short page of high strikes cannot hide it.
-    far_cap = min(MC.WHEEL_MAX_STRIKE, float(bid) * MC.FAR_OTM_FRACTION)
+    # OTM puts only. Paging stays inside this bound and runs to the last page.
     contracts, snaps = _listed(reader, md, underlying, today, "put", MC.SELL_BUYBACK_MAX_DTE,
-                               strike_lte=far_cap)
+                               strike_lte=_otm_strike_cap(bid))
     chosen, counts = _choose_put(contracts, snaps, underlying=underlying, today=today, spot_bid=bid,
                                  spot_ask=ask, cash=cash, allowance=_allowance(cfg), mode="far")
     if chosen is None:
         print("Refused: no far-OTM weekly put whose strike*100 plus allowance fits mechanics cash. "
               f"Nothing was sent. {_filter_summary(counts)}")
         return 2
+    print(_put_choice_line(chosen, bid))
     ids = []
     rows = []
     ledger = Ledger(journal, cfg.policy)
@@ -1033,20 +1085,46 @@ def _sell_price_walk(bid):
     return _distinct_prices(prices)
 
 
-def _buy_price_walk(ask):
+def _buyback_cap(sold_fill):
+    """Per-share cap for a buy-to-close walk.
+
+    The cap is ``min(max(BUYBACK_MAX_PRICE, sold_fill + BUYBACK_EXTRA_OVER_SOLD),
+    BUYBACK_ABS_MAX)``. A missing or non-positive fill uses the floor, which
+    is what that formula returns for a zero fill. One contract therefore
+    loses less than 100 dollars.
+
+    Args:
+        sold_fill: Broker filled average of the opening sell, per share.
+
+    Returns:
+        Cap per share, rounded to cents.
+    """
+    try:
+        sold = float(sold_fill)
+    except (TypeError, ValueError):
+        sold = 0.0
+    if sold < 0:
+        sold = 0.0
+    raised = max(float(MC.BUYBACK_MAX_PRICE), sold + float(MC.BUYBACK_EXTRA_OVER_SOLD))
+    return round(min(raised, float(MC.BUYBACK_ABS_MAX)), 2)
+
+
+def _buy_price_walk(ask, sold_fill=None):
     """Limits for a buy the indicative ask did not get filled.
 
-    Starts at the ask tick-rounded up and doubles once, then stops at
-    ``MC.BUYBACK_MAX_PRICE``. A quote already above the cap is a single
-    order at the cap. No price is above the cap.
+    Starts at the ask tick-rounded up and doubles once, then stops at the
+    cap from ``sold_fill``. A missing fill keeps ``MC.BUYBACK_MAX_PRICE``.
+    A quote already above the cap is a single order at the cap. No price
+    is above the cap.
 
     Args:
         ask: Indicative ask per share. Not an OPRA quote.
+        sold_fill: Broker filled average of the opening sell, per share.
 
     Returns:
         Lowest limit first, at most ``MC.PRICE_WALK_MAX_STEPS`` prices.
     """
-    cap = round(float(MC.BUYBACK_MAX_PRICE), 2)
+    cap = _buyback_cap(sold_fill)
     start = W.tick_round_up(float(ask))
     if start > cap or start <= 0:
         start = cap
@@ -1059,10 +1137,11 @@ def _buy_price_walk(ask):
     return _distinct_prices(prices)
 
 
-def _clamp_walk_price(side, limit):
-    """Keep a sell at or above the floor and a buy at or below the cap."""
+def _clamp_walk_price(side, limit, buy_cap=None):
+    """Keep a sell at or above the floor and a buy at or below its cap."""
     if side == "buy":
-        return min(round(float(limit), 2), round(float(MC.BUYBACK_MAX_PRICE), 2))
+        cap = MC.BUYBACK_MAX_PRICE if buy_cap is None else buy_cap
+        return min(round(float(limit), 2), round(float(cap), 2))
     return max(round(float(limit), 2), round(float(MC.SELL_PUT_FLOOR), 2))
 
 
@@ -1191,7 +1270,7 @@ def _walk_result(sent, order, place, settled):
 
 
 def _walk_option(journal, om, reader, ids, *, symbol, side, intent, purpose, signal_key,
-                 prices, reservations, cash_check, label, sleep):
+                 prices, reservations, cash_check, label, sleep, buy_cap=None):
     """Submit one limit at a time, walking ``prices`` until one fills.
 
     Never more than one order on ``side`` is working. Each unfilled limit
@@ -1209,7 +1288,7 @@ def _walk_option(journal, om, reader, ids, *, symbol, side, intent, purpose, sig
         return _walk_result(sent, None, None, True)
 
     for index, raw in enumerate(prices):
-        limit = _clamp_walk_price(side, raw)
+        limit = _clamp_walk_price(side, raw, buy_cap)
         if sent and abs(sent[-1] - limit) < 1e-9:
             continue
         if _working_side(reader, symbol, side):
@@ -1290,7 +1369,8 @@ def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, 
     held = option_qty(reader.positions(), occ)
     ok = (order or {}).get("status") == "filled" and held > 0
     _record_walk_row(rows, journal, "sell_put", occ, sell, ok, "put was not filled",
-                     {"strike": chosen["strike"]})
+                     {"strike": chosen["strike"], "rule": chosen.get("rule"),
+                      "bid": chosen["bid"]})
     if not ok:
         if held > 0:
             flatten["occ"] = occ
@@ -1318,11 +1398,12 @@ def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, 
             "last_limit": "none", "broker_status": "none", "reprices": 0, "price_walk": [],
         })
         return
+    sold_px = _order_fill_price(order)
     buy = _walk_option(
         journal, om, reader, ids, symbol=occ, side="buy", intent="buy_to_close",
         purpose="BUY_TO_CLOSE", signal_key=f"buyback:{journal.run_id}:{occ}",
-        prices=_buy_price_walk(ask), reservations=[], cash_check=None,
-        label="buyback", sleep=sleep)
+        prices=_buy_price_walk(ask, sold_px), reservations=[], cash_check=None,
+        label="buyback", sleep=sleep, buy_cap=_buyback_cap(sold_px))
     seen = buy["order"]
     if (buy["place"] or {}).get("status") not in ("BLOCKED", "DUPLICATE", "rejected", "DRY_RUN"):
         if buy["place"] and cycle["state"] == "PUT_OPEN":
@@ -1339,11 +1420,45 @@ def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, 
         flatten["occ"] = None
 
 
+def _order_fill_price(order):
+    """Filled average per share from a broker order, or None."""
+    try:
+        px = float((order or {}).get("filled_avg_price"))
+    except (TypeError, ValueError):
+        return None
+    if px <= 0:
+        return None
+    return px
+
+
+def _sold_fill_price(reader, symbol):
+    """Filled average of the latest sell of ``symbol``, from the broker."""
+    try:
+        orders = reader.orders("all") or []
+    except (TypeError, AttributeError, BrokerError):
+        return None
+    best = None
+    best_stamp = ""
+    for order in orders:
+        if order.get("symbol") != symbol or order.get("side") != "sell":
+            continue
+        px = _order_fill_price(order)
+        if px is None:
+            continue
+        stamp = str(order.get("submitted_at") or "")
+        if best is None or stamp >= best_stamp:
+            best = px
+            best_stamp = stamp
+    return best
+
+
 def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep):
     """Buy the short put back, walking the indicative ask up to the cap.
 
-    ``attempts`` and ``interval`` are unused; the walk uses the mechanics
-    poll window. A still-open short is left for the caller to report.
+    The cap uses the broker's filled average on the opening sell, the same
+    formula as the suite buyback. ``attempts`` and ``interval`` are unused;
+    the walk uses the mechanics poll window. A still-open short is left for
+    the caller to report.
     """
     del attempts, interval
     if option_qty(reader.positions(), occ) <= 0:
@@ -1353,11 +1468,12 @@ def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep):
         ask = float(quote["ap"])
     except (KeyError, TypeError, ValueError):
         return None
+    sold_px = _sold_fill_price(reader, occ)
     walk = _walk_option(
         journal, om, reader, ids, symbol=occ, side="buy", intent="buy_to_close",
         purpose="BUY_TO_CLOSE", signal_key=f"cleanup:{journal.run_id}:{occ}",
-        prices=_buy_price_walk(ask), reservations=[], cash_check=None,
-        label="buy_to_close", sleep=sleep)
+        prices=_buy_price_walk(ask, sold_px), reservations=[], cash_check=None,
+        label="buy_to_close", sleep=sleep, buy_cap=_buyback_cap(sold_px))
     return walk["order"]
 
 
