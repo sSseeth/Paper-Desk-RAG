@@ -12,6 +12,27 @@ import requests
 from .config import PAPER_TRADING_HOST, DATA_HOST
 
 
+# Filter values accepted by GET /v2/account/activities (`activity_types`).
+# Source: ActivityTypeFilter at
+# https://docs.alpaca.markets/reference/getaccountactivities
+# checked 2026-11-18. OPXRC is not in this set. Option exercise is OPEXC.
+# TRANS and MISC are filter aliases, not stored activity types. The main
+# wheel reconcile calls PaperReader.activities with DEFAULT_ACTIVITY_TYPES,
+# so an unknown code fails that run as well as the mechanics suites.
+ACTIVITY_TYPE_ALLOWLIST = frozenset({
+    "ACATC", "ACATS", "ALLOC", "CFEE", "CGD", "CIL", "CSD", "CSR", "CSW",
+    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW",
+    "DIVTXEX", "DIVWH", "DVF", "ECEXP", "EXTRD", "FEE", "FIMAT", "FXCNV",
+    "FXTRD", "INT", "INTNRA", "INTTW", "INVPNL", "JNL", "JNLC", "JNLS", "MA",
+    "MEM", "NC", "OCT", "OPASN", "OPCA", "OPCSH", "OPEXC", "OPEXP", "OPTRD",
+    "PTC", "PTR", "REO", "REORG", "SC", "SPIN", "SPLIT", "SUB", "SWP", "TRD",
+    "VOF", "WH", "FOPT", "FILL", "MISC", "TRANS",
+})
+
+# Assignment, expiry, exercise, option trades, and fills. Exercise is OPEXC.
+DEFAULT_ACTIVITY_TYPES = ("OPASN", "OPEXP", "OPEXC", "OPTRD", "FILL")
+
+
 class BrokerError(Exception):
     pass
 
@@ -134,10 +155,21 @@ class PaperReader:
             seen.add(nxt)
             tok = nxt
 
-    def activities(self, types=("OPASN", "OPEXP", "OPXRC", "OPTRD", "FILL"), after=None):
+    def activities(self, types=DEFAULT_ACTIVITY_TYPES, after=None):
+        """Non-trade and fill activity, filtered to documented types.
+
+        An unknown `activity_types` value makes the broker return HTTP 422
+        (`invalid activity type`). The check is local so a typo never becomes
+        that request. The default set is what wheel reconcile asks for.
+        """
+        chosen = tuple(types)
+        unknown = [name for name in chosen if name not in ACTIVITY_TYPE_ALLOWLIST]
+        if unknown:
+            raise BrokerError(
+                "activity type not in the documented Alpaca allowlist: " + ",".join(unknown))
         out, tok = [], None
         while True:
-            p = {"activity_types": ",".join(types), "direction": "asc", "page_size": 100}
+            p = {"activity_types": ",".join(chosen), "direction": "asc", "page_size": 100}
             if after:
                 p["after"] = after
             if tok:

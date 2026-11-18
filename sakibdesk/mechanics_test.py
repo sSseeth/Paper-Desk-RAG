@@ -393,12 +393,133 @@ def _open_ids(reader, symbol):
 
 
 def _finish(rows, state, passed, alert=""):
-    _print_table(rows)
-    _print_state(state)
-    if alert:
-        print(alert)
+    """Print the step table, the broker snapshot, and RESULT.
+
+    A failure while formatting the snapshot still prints RESULT, so a
+    traceback cannot replace the final line.
+    """
+    try:
+        _print_table(rows)
+        _print_state(state)
+        if alert:
+            print(alert)
+    except Exception as exc:  # the RESULT line has to be reached
+        print(f"WARNING: could not print the final broker state ({type(exc).__name__}: {exc}).")
+        passed = False
     print("RESULT:", "PASS" if passed else "FAIL")
     return 0 if passed else 2
+
+
+def _guarded(label, fn):
+    """Run one cleanup step. A failure does not skip the steps after it.
+
+    BrokerError is the usual failure: GET /v2/account/activities returns
+    422 for an unknown activity type. Any other exception is contained for
+    the same reason. SystemExit and KeyboardInterrupt are not caught.
+
+    Returns:
+        `(result, None)` on success, or `(None, exc)` when `fn` raised.
+    """
+    try:
+        return fn(), None
+    except Exception as exc:  # cleanup must continue; see the docstring
+        print(f"WARNING: {label} failed ({type(exc).__name__}: {exc}). "
+              "Continuing with the remaining cleanup.")
+        return None, exc
+
+
+def _position_is_short(pos):
+    """True when the broker position is a short lot."""
+    try:
+        qty = float((pos or {}).get("qty") or 0)
+    except (TypeError, ValueError):
+        return False
+    if abs(qty) <= 1e-9:
+        return False
+    if qty < 0:
+        return True
+    return (pos or {}).get("side") == "short"
+
+
+def _snapshot_or_empty(reader, symbols):
+    """Positions and open orders, or an empty snapshot when the read fails."""
+    try:
+        state = broker_snapshot(reader, symbols)
+    except Exception as exc:  # the report has to exist even when the read fails
+        print(f"WARNING: final broker snapshot failed ({type(exc).__name__}: {exc}).")
+        return {
+            "positions": [],
+            "open_orders": [],
+            "equity_qty": {},
+            "snapshot_error": type(exc).__name__,
+        }
+    return state
+
+
+def _sell_buyback_alert(state, occ):
+    """Warning text when `occ` is still short or an order is still working.
+
+    The short-put sentence starts with ``SHORT PUT STILL OPEN`` so the
+    operator sees it first. Open orders are named after that sentence.
+    """
+    parts = []
+    short = option_qty(state.get("positions"), occ)
+    if short > 0:
+        parts.append(
+            f"SHORT PUT STILL OPEN: {occ} qty {short:g}. "
+            "Buyback and cleanup did not flatten this short put.")
+    orders = state.get("open_orders") or []
+    if orders:
+        detail = ", ".join(f"{order.get('symbol')} {order.get('id')}" for order in orders)
+        parts.append(f"WARNING: OPEN ORDER STILL WORKING: {detail}.")
+    if state.get("snapshot_error"):
+        parts.append("WARNING: final broker snapshot failed. Treat open exposure as unknown.")
+    return " ".join(parts)
+
+
+def _exposure_warning(state):
+    """Loud warning when any short option or open order remains."""
+    parts = []
+    for pos in state.get("positions") or []:
+        if W.parse_occ(pos.get("symbol")) and _position_is_short(pos):
+            parts.append(f"SHORT OPTION STILL OPEN: {pos.get('symbol')} qty {pos.get('qty')}.")
+    orders = state.get("open_orders") or []
+    if orders:
+        detail = ", ".join(
+            f"{order.get('symbol')} {order.get('id')} {order.get('side')}" for order in orders)
+        parts.append(f"OPEN ORDER STILL WORKING: {detail}.")
+    if state.get("snapshot_error"):
+        parts.append("Final broker snapshot failed. Treat open exposure as unknown.")
+    if not parts:
+        return ""
+    return ("WARNING: " + " ".join(parts) +
+            " The mechanics account is not flat. Do not start another short.")
+
+
+def _cancel_known_orders(om, reader, ids):
+    """Cancel-confirm each remembered order. One BrokerError continues."""
+    for item in list(ids):
+        order_id = item.get("id")
+        _guarded(
+            f"cancel {order_id}",
+            lambda item=item: _cancel_open(om, reader, item["id"], item.get("cid")))
+
+
+def _cancel_open_symbol(om, reader, symbol):
+    """Cancel-confirm every open order on `symbol`."""
+    if not symbol:
+        return
+    listed, err = _guarded("list open orders", lambda: list(reader.orders("open") or []))
+    if err is not None or not listed:
+        return
+    for order in listed:
+        if order.get("symbol") != symbol or not order.get("id"):
+            continue
+        order_id = order.get("id")
+        cid = order.get("client_order_id")
+        _guarded(
+            f"cancel {order_id}",
+            lambda order_id=order_id, cid=cid: _cancel_open(om, reader, order_id, cid))
 
 
 def _record(root, check, expected_account_id, config_hash, evidence, enabled):
@@ -473,11 +594,18 @@ def run_stock_suite(cfg, journal, reader, writer, md, *, root, expected_account_
         rows.append(_row("broker_error", "FAIL", "BROKER", None, type(exc).__name__))
         journal_step(journal, "broker_error", None, "BROKER", "FAIL", symbol, {"error": type(exc).__name__})
     finally:
-        _flatten_shares(cfg, journal, om, reader, md, ids, symbol, bought["qty"], attempts, interval, sleep)
-    state = broker_snapshot(reader, [symbol])
-    flat = state["equity_qty"].get(symbol, 0) == 0 and not state["open_orders"]
+        _guarded(
+            "flatten shares",
+            lambda: _flatten_shares(
+                cfg, journal, om, reader, md, ids, symbol, bought["qty"], attempts, interval, sleep))
+        _cancel_known_orders(om, reader, ids)
+    state = _snapshot_or_empty(reader, [symbol])
+    flat = state.get("equity_qty", {}).get(symbol, 0) == 0 and not state.get("open_orders")
+    if state.get("snapshot_error"):
+        flat = False
     passed = bool(rows) and all(row["result"] == "PASS" for row in rows) and flat
-    code = _finish(rows, state, passed)
+    alert = _exposure_warning(state)
+    code = _finish(rows, state, passed, alert)
     if not passed:
         return code
     partial = next(row["evidence"] for row in rows if row["step"] == "partial_fill_protection")
@@ -937,7 +1065,7 @@ def _open_cycle(journal, underlying, occ, strike, expiry, client_order_id, reser
 
 def _activity_label(occ, activities):
     types = {row.get("activity_type") for row in activities or [] if row.get("symbol") == occ}
-    if types & {"OPASN", "OPXRC"}:
+    if types & set(W.ASSIGNMENT_ACTIVITY_TYPES):
         return MC.OBSERVED_ASSIGNMENT
     if "OPEXP" in types:
         return "OPEXP"
@@ -964,10 +1092,131 @@ def _otm_strike_cap(spot_bid):
     return min(float(MC.WHEEL_MAX_STRIKE), float(spot_bid))
 
 
+def _f_option_leftover(reader):
+    """Short F puts and open F option orders already on the account.
+
+    Returns:
+        `(short OCC symbols, open order dicts)`. Equity orders on F are
+        not included. A long option is not a leftover short.
+    """
+    shorts, seen = [], set()
+    for pos in reader.positions() or []:
+        parsed = W.parse_occ(pos.get("symbol"))
+        if not parsed or parsed["underlying"] != MC.WHEEL_UNDERLYING or parsed["type"] != "put":
+            continue
+        if not _position_is_short(pos):
+            continue
+        symbol = pos.get("symbol")
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            shorts.append(symbol)
+    orders = []
+    for order in reader.orders("open") or []:
+        parsed = W.parse_occ(order.get("symbol"))
+        if parsed and parsed["underlying"] == MC.WHEEL_UNDERLYING and order.get("id"):
+            orders.append(order)
+    return shorts, orders
+
+
+def _symbol_has_open_order(reader, symbol):
+    for order in reader.orders("open") or []:
+        if order.get("symbol") == symbol:
+            return True
+    return False
+
+
+def _cleanup_sell_buyback(journal, om, ledger, reader, md, ids, flatten, attempts, interval, sleep):
+    """Buy back a short left by this run, sync, then cancel this run's orders.
+
+    Each broker call is isolated. A 422 from ``activities`` must not skip
+    the cancels. The caller prints the snapshot after this returns.
+    """
+    occ = flatten.get("occ")
+
+    def still_short():
+        return bool(occ) and option_qty(reader.positions(), occ) > 0
+
+    open_short, err = _guarded("read short option", still_short)
+    if err is None and open_short:
+        _guarded(
+            "buy_to_close",
+            lambda: _buy_to_close(
+                journal, om, reader, md, ids, occ, attempts, interval, sleep))
+        _guarded("sync_wheel", lambda: _sync_wheel(journal, om, ledger, reader))
+    _cancel_known_orders(om, reader, ids)
+    _cancel_open_symbol(om, reader, occ)
+
+
+def _report_recovery(reader, symbols):
+    """Final state for a leftover run. Nothing is written to the lifecycle gate."""
+    state = _snapshot_or_empty(reader, symbols)
+    try:
+        _print_state(state)
+    except Exception as exc:  # RESULT still has to be printed
+        print(f"WARNING: could not print the final broker state ({type(exc).__name__}: {exc}).")
+        state = {"snapshot_error": type(exc).__name__, "positions": [], "open_orders": []}
+    alert = _exposure_warning(state)
+    if alert:
+        print(alert)
+    print("Nothing was recorded.")
+    print("Re-run wheel-sell-buyback after this account is flat.")
+    print("RESULT: FAIL")
+
+
+def _recover_f_option_leftover(cfg, journal, reader, writer, md, shorts, stale_orders,
+                               attempts, interval, sleep):
+    """Cancel stale F option orders and buy back a short F put. No new put.
+
+    The buy uses the existing walk and stops at ``BUYBACK_ABS_MAX`` (1.00
+    per share). This run does not record wheel-sell-buyback.
+    """
+    print("LEFTOVER: a short F put or an open F option order is already on the mechanics account.")
+    print("A new put was not opened.")
+    symbols = [MC.WHEEL_UNDERLYING] + list(shorts) + [order.get("symbol") for order in stale_orders]
+    try:
+        ledger = Ledger(journal, cfg.policy)
+        om = OrderManager(journal, cfg, writer=writer, ledger=ledger)
+        ids = []
+        for order in stale_orders:
+            symbol = order.get("symbol")
+            order_id = order.get("id")
+            cid = order.get("client_order_id")
+
+            def cancel_one(order_id=order_id, cid=cid):
+                return _cancel_confirmed(om, reader, order_id, cid)
+
+            confirmed, err = _guarded(f"cancel {order_id}", cancel_one)
+            if err is None and confirmed:
+                print(f"Canceled open F option order {order_id} on {symbol} (cancel-confirmed).")
+            else:
+                print(f"WARNING: open F option order {order_id} on {symbol} was not cancel-confirmed.")
+        for occ in shorts:
+            if _symbol_has_open_order(reader, occ):
+                print(f"Skipped buy-to-close {occ}: an open F option order is still working.")
+                continue
+            print(f"Buying to close short put {occ} with the bounded walk, "
+                  f"cap {MC.BUYBACK_ABS_MAX:.2f} per share.")
+            _guarded(
+                f"buy_to_close {occ}",
+                lambda occ=occ: _buy_to_close(
+                    journal, om, reader, md, ids, occ, attempts, interval, sleep, abs_cap=True))
+        _cancel_known_orders(om, reader, ids)
+    except Exception as exc:  # the re-run line has to be reached
+        print(f"WARNING: leftover recovery stopped ({type(exc).__name__}: {exc}).")
+    _report_recovery(reader, symbols)
+    return 2
+
+
 def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_account_id, record=True,
                            attempts=MC.PRICE_WALK_ATTEMPTS, interval=MC.PRICE_WALK_INTERVAL_SEC,
                            sleep=time.sleep):
     """Sell one OTM cash-secured put and buy it back. Records on PASS.
+
+    A short F put or an open F option order already on the account is
+    recovered instead. Those orders are cancel-confirmed, the short is
+    bought back at or below ``BUYBACK_ABS_MAX``, and nothing is recorded.
+    Cleanup isolates each broker call so one BrokerError cannot skip the
+    cancels or the final snapshot.
 
     Far OTM is preferred. A nearer OTM put is sold when the far strikes have
     no sellable bid. The option walk polls ``MC.PRICE_WALK_ATTEMPTS`` times
@@ -982,6 +1231,14 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
     if not open_now:
         print(_closed_message())
         return 2
+    try:
+        shorts, stale_orders = _f_option_leftover(reader)
+    except Exception as exc:  # do not sell a new put when exposure cannot be read
+        print(f"Refused: could not read F option exposure ({type(exc).__name__}). Nothing was sent.")
+        return 2
+    if shorts or stale_orders:
+        return _recover_f_option_leftover(
+            cfg, journal, reader, writer, md, shorts, stale_orders, attempts, interval, sleep)
     underlying = MC.WHEEL_UNDERLYING
     quote = _quote(md, underlying)
     try:
@@ -1017,22 +1274,28 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
         _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, chosen, attempts, interval, sleep)
     except BrokerError as exc:
         rows.append(_row("broker_error", "FAIL", "BROKER", None, type(exc).__name__))
+    except Exception as exc:  # a traceback must not replace the final state report
+        rows.append(_row("broker_error", "FAIL", "BROKER", None, type(exc).__name__))
+        print(f"WARNING: wheel-sell-buyback stopped ({type(exc).__name__}: {exc}).")
     finally:
-        if flatten["occ"] and option_qty(reader.positions(), flatten["occ"]) > 0:
-            _buy_to_close(journal, om, reader, md, ids, flatten["occ"], attempts, interval, sleep)
-            _sync_wheel(journal, om, ledger, reader)
-        for item in ids:
-            _cancel_open(om, reader, item["id"], item.get("cid"))
-    state = broker_snapshot(reader, [underlying, occ])
-    short = option_qty(reader.positions(), occ)
-    flat = short == 0 and not [
-        order for order in state["open_orders"] if order.get("symbol") == occ]
-    passed = bool(rows) and all(row["result"] == "PASS" for row in rows) and flat
-    alert = ""
-    if short > 0:
-        alert = (f"SHORT PUT STILL OPEN: {occ} qty {short:g}. "
-                 "Buyback and cleanup did not flatten this short put.")
-    code = _finish(rows, state, passed, alert)
+        _guarded(
+            "cleanup",
+            lambda: _cleanup_sell_buyback(
+                journal, om, ledger, reader, md, ids, flatten, attempts, interval, sleep))
+    try:
+        state = _snapshot_or_empty(reader, [underlying, occ])
+        short = option_qty(state.get("positions"), occ)
+        open_on_occ = [order for order in state.get("open_orders") or [] if order.get("symbol") == occ]
+        flat = short == 0 and not open_on_occ
+        if state.get("snapshot_error"):
+            flat = False
+        passed = bool(rows) and all(row["result"] == "PASS" for row in rows) and flat
+        alert = _sell_buyback_alert(state, occ)
+        code = _finish(rows, state, passed, alert)
+    except Exception as exc:  # the RESULT line has to be reached
+        print(f"WARNING: final report failed ({type(exc).__name__}: {exc}).")
+        print("RESULT: FAIL")
+        return 2
     if not passed:
         return code
     evidence = f"wheel_sell_buyback run {journal.run_id} broker fill and buyback {occ}"
@@ -1452,13 +1715,15 @@ def _sold_fill_price(reader, symbol):
     return best
 
 
-def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep):
+def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep, abs_cap=False):
     """Buy the short put back, walking the indicative ask up to the cap.
 
     The cap uses the broker's filled average on the opening sell, the same
-    formula as the suite buyback. ``attempts`` and ``interval`` are unused;
-    the walk uses the mechanics poll window. A still-open short is left for
-    the caller to report.
+    formula as the suite buyback. ``abs_cap`` skips that fill and stops at
+    ``BUYBACK_ABS_MAX`` (1.00 per share). Leftover recovery uses that ceiling
+    because this run has no opening fill of its own. ``attempts`` and
+    ``interval`` are unused; the walk uses the mechanics poll window. A
+    still-open short is left for the caller to report.
     """
     del attempts, interval
     if option_qty(reader.positions(), occ) <= 0:
@@ -1468,7 +1733,10 @@ def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep):
         ask = float(quote["ap"])
     except (KeyError, TypeError, ValueError):
         return None
-    sold_px = _sold_fill_price(reader, occ)
+    if abs_cap:
+        sold_px = MC.BUYBACK_ABS_MAX
+    else:
+        sold_px = _sold_fill_price(reader, occ)
     walk = _walk_option(
         journal, om, reader, ids, symbol=occ, side="buy", intent="buy_to_close",
         purpose="BUY_TO_CLOSE", signal_key=f"cleanup:{journal.run_id}:{occ}",
@@ -1491,6 +1759,38 @@ def run_wheel_expiry(cfg, journal, reader, writer, md, *, root, expected_account
         return _expiry_start(cfg, journal, reader, writer, md, attempts, interval, sleep)
     return _expiry_reconcile(cfg, journal, reader, writer, md, root, expected_account_id,
                              record, attempts, interval, sleep)
+
+
+def _abort_expiry_start(journal, om, reader, md, ids, underlying, occ, attempts, interval, sleep, note):
+    """Cancel this start's orders and buy back a short put. Always print state.
+
+    One BrokerError does not skip the remaining cancels or the snapshot.
+    The caller has not stored a wheel-expiry track.
+    """
+    _cancel_known_orders(om, reader, ids)
+    _cancel_open_symbol(om, reader, occ)
+
+    def still_short():
+        return bool(occ) and option_qty(reader.positions(), occ) > 0
+
+    open_short, err = _guarded("read short option", still_short)
+    if err is None and open_short:
+        _guarded(
+            "buy_to_close",
+            lambda: _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep))
+        _cancel_known_orders(om, reader, ids)
+        _cancel_open_symbol(om, reader, occ)
+    state = _snapshot_or_empty(reader, [underlying, occ])
+    try:
+        _print_state(state)
+    except Exception as exc:  # RESULT still has to be printed
+        print(f"WARNING: could not print the final broker state ({type(exc).__name__}: {exc}).")
+    alert = _sell_buyback_alert(state, occ)
+    if alert:
+        print(alert)
+    print("RESULT: FAIL")
+    print(note)
+    return 2
 
 
 def _expiry_start(cfg, journal, reader, writer, md, attempts, interval, sleep):
@@ -1532,29 +1832,35 @@ def _expiry_start(cfg, journal, reader, writer, md, attempts, interval, sleep):
     occ = chosen["symbol"]
     limit = W.tick_round_down(chosen["bid"])
     body = W.option_order_body(occ, "sell", limit, "sell_to_open", MC.WHEEL_CONTRACTS)
-    result = _remember(ids, om.place(
-        strategy="WHEEL", symbol=occ, purpose="SELL_PUT_OPEN", signal_key=f"expiry:{journal.run_id}:{occ}",
-        body=body, reservations=[("WHEEL", "PUT_COLLATERAL", chosen["need"], underlying)],
-        cash_check=lambda db, need=chosen["need"]: C._cash_ok(db, ledger, "WHEEL", need)))
-    order = poll_order(reader, (result.get("order") or {}).get("id"), {"filled"}, attempts, interval, sleep)
+    try:
+        result = _remember(ids, om.place(
+            strategy="WHEEL", symbol=occ, purpose="SELL_PUT_OPEN", signal_key=f"expiry:{journal.run_id}:{occ}",
+            body=body, reservations=[("WHEEL", "PUT_COLLATERAL", chosen["need"], underlying)],
+            cash_check=lambda db, need=chosen["need"]: C._cash_ok(db, ledger, "WHEEL", need)))
+        order = poll_order(reader, (result.get("order") or {}).get("id"), {"filled"}, attempts, interval, sleep)
+    except Exception as exc:  # a traceback must not replace the final state report
+        print(f"WARNING: wheel-expiry start stopped ({type(exc).__name__}: {exc}).")
+        _guarded(
+            "journal",
+            lambda: journal_step(journal, "wheel_expiry_start", None, "BROKER", "FAIL", occ))
+        return _abort_expiry_start(
+            journal, om, reader, md, ids, underlying, occ, attempts, interval, sleep,
+            "wheel_lifecycle NOT recorded: the broker call failed.")
     if (order or {}).get("status") != "filled":
-        _cancel_open(om, reader, (result.get("order") or {}).get("id"), result.get("client_order_id"))
-        if option_qty(reader.positions(), occ) > 0:
-            _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep)
-        journal_step(journal, "wheel_expiry_start", order, "BROKER", "FAIL", occ)
-        print("RESULT: FAIL")
-        _print_state(broker_snapshot(reader, [underlying, occ]))
-        print("wheel_lifecycle NOT recorded: the put did not fill.")
-        return 2
+        _guarded(
+            "journal",
+            lambda: journal_step(journal, "wheel_expiry_start", order, "BROKER", "FAIL", occ))
+        return _abort_expiry_start(
+            journal, om, reader, md, ids, underlying, occ, attempts, interval, sleep,
+            "wheel_lifecycle NOT recorded: the put did not fill.")
     cycle = _open_cycle(journal, underlying, occ, chosen["strike"], chosen["expiry"],
                         result.get("client_order_id"), chosen["need"], "PUT_SUBMITTED")
-    _sync_wheel(journal, om, ledger, reader)
-    cycle = _cycle(journal, cycle["cycle_id"])
+    _, sync_err = _guarded("sync_wheel", lambda: _sync_wheel(journal, om, ledger, reader))
+    cycle = _cycle(journal, cycle["cycle_id"]) if sync_err is None else None
     if cycle is None or cycle["state"] != "PUT_OPEN":
-        _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep)
-        print("RESULT: FAIL")
-        print("wheel_lifecycle NOT recorded: the runner did not reach PUT_OPEN.")
-        return 2
+        return _abort_expiry_start(
+            journal, om, reader, md, ids, underlying, occ, attempts, interval, sleep,
+            "wheel_lifecycle NOT recorded: the runner did not reach PUT_OPEN.")
     track = {
         "cycle_id": cycle["cycle_id"],
         "underlying": underlying,
@@ -1577,7 +1883,7 @@ def _expiry_start(cfg, journal, reader, writer, md, attempts, interval, sleep):
     print(f"RESULT: STARTED put {occ} strike {chosen['strike']} expiry {chosen['expiry']}")
     print("wheel_lifecycle NOT recorded: assignment has not been observed. "
           "Run --suite wheel-expiry --reconcile on a later session.")
-    _print_state(broker_snapshot(reader, [underlying, occ]))
+    _print_state(_snapshot_or_empty(reader, [underlying, occ]))
     return 0
 
 
@@ -1615,7 +1921,7 @@ def _expiry_reconcile(cfg, journal, reader, writer, md, root, expected_account_i
             track["put_evidence"] = MC.MOCK_EVIDENCE
             journal.set(MC.TRACK_KEY, track)
             journal_step(journal, "wheel_expiry_reconcile", None, MC.MOCK_EVIDENCE, "MOCK", put_symbol, {
-                "note": "option gone without OPASN/OPXRC/OPEXP",
+                "note": "option gone without OPASN/OPEXC/OPEXP",
             })
             print("RESULT: MOCK")
             print("wheel_lifecycle NOT recorded: evidence is MOCK. "
