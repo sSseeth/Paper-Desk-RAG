@@ -257,6 +257,15 @@ def test_config_hash_unchanged_and_caps_are_mechanics_only():
     assert MC.STOCK_MAX_NOTIONAL == 60
     assert MC.WHEEL_MAX_STRIKE == 30
     assert MC.FAR_OTM_FRACTION == 0.90
+    # The indicative walk is mechanics-only. It is not part of the config hash.
+    assert MC.SELL_PUT_FLOOR == 0.01
+    assert MC.BUYBACK_MAX_PRICE == 0.25
+    assert MC.PRICE_WALK_ATTEMPTS == 30
+    assert MC.PRICE_WALK_INTERVAL_SEC == 1.0
+    assert MC.PRICE_WALK_MAX_STEPS == 3
+    walk_defaults = MT.run_wheel_sell_buyback.__kwdefaults__
+    assert walk_defaults["attempts"] == MC.PRICE_WALK_ATTEMPTS
+    assert walk_defaults["interval"] == MC.PRICE_WALK_INTERVAL_SEC
     text = open(os.path.join(ROOT, "policy.json"), encoding="utf-8").read()
     assert "MECH_" not in text and MC.STOCK_SYMBOL not in json.load(open(os.path.join(ROOT, "policy.json")))["wheel"]["universe"]
 
@@ -503,6 +512,251 @@ def test_wheel_sell_buyback_refusal_prints_filter_counts(tmp_path, capsys):
     assert "no far-OTM weekly put" in out
     assert "contracts listed 1, after DTE filter 1, after strike filter 1, with positive bid 0" in out
     assert fake.submits == []
+
+
+class WalkBroker(MechFake):
+    """Options rest until the limit reaches the price this broker will trade.
+
+    A sell fills at or below ``sell_fill_at``. A buy fills at or above
+    ``buy_fill_at``. ``None`` never fills that side. A cancel can fill the
+    resting sell first, which is the race a replace must not double.
+    """
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.sell_fill_at = None
+        self.buy_fill_at = None
+        self.race_sell_cancel = False
+        self.race_raises = False
+        self._raced = False
+        self.journal = None
+        self.collateral_at_submit = []
+        self.working_at_submit = []
+        self.max_option_qty = 0.0
+
+    def _should_fill(self, body):
+        symbol = body.get("symbol") or ""
+        if len(symbol) <= 10:
+            return True
+        try:
+            limit = float(body.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            return False
+        side = body.get("side")
+        if side == "sell":
+            return self.sell_fill_at is not None and limit <= self.sell_fill_at + 1e-9
+        if side == "buy":
+            return self.buy_fill_at is not None and limit + 1e-9 >= self.buy_fill_at
+        return False
+
+    def _note(self, body):
+        symbol = body.get("symbol")
+        side = body.get("side")
+        working = 0
+        for order in self.orders("open"):
+            if order.get("symbol") == symbol and order.get("side") == side:
+                working += 1
+        self.working_at_submit.append(working)
+        if self.journal is None or body.get("position_intent") != "sell_to_open":
+            return
+        row = self.journal.db.execute(
+            "SELECT COUNT(*) n FROM reservations WHERE status='ACTIVE' AND kind='PUT_COLLATERAL'"
+        ).fetchone()
+        self.collateral_at_submit.append(row["n"])
+
+    def submit(self, body):
+        self._note(body)
+        self.fill_marketable = self._should_fill(body)
+        order = super().submit(body)
+        if len(body.get("symbol") or "") > 10 and order.get("status") != "filled":
+            stored = self.book[order["id"]]
+            stored["status"] = "new"
+            return dict(stored)
+        return order
+
+    def _apply_fill(self, sym, side, qty):
+        super()._apply_fill(sym, side, qty)
+        if len(sym) > 10:
+            self.max_option_qty = max(self.max_option_qty, MT.option_qty(self.positions(), sym))
+
+    def cancel(self, oid):
+        order = self.book.get(oid)
+        resting = {"new", "accepted", "pending_new", "partially_filled", "held"}
+        if (self.race_sell_cancel and not self._raced and order and order.get("side") == "sell"
+                and order.get("status") in resting):
+            self._raced = True
+            order["status"] = "filled"
+            order["filled_qty"] = order["qty"]
+            order["filled_avg_price"] = order.get("limit_price")
+            self._apply_fill(order["symbol"], "sell", float(order["qty"]))
+            self.cancels.append(oid)
+            if self.race_raises:
+                raise BrokerError("cancel raced a fill")
+            return
+        super().cancel(oid)
+
+
+def _run_walk(tmp_path, fake, clock, sleep):
+    cfg = Config(ROOT)
+    journal = _journal(tmp_path, cfg, clock)
+    fake.journal = journal
+    code = MT.run_wheel_sell_buyback(
+        cfg, journal, fake, fake, fake, root=str(tmp_path), expected_account_id="MECH-1",
+        record=True, attempts=1, interval=0, sleep=sleep)
+    return journal, code
+
+
+def _limits(fake, intent):
+    return [body["limit_price"] for body in fake.submits if body.get("position_intent") == intent]
+
+
+def _active_collateral(journal):
+    return journal.db.execute(
+        "SELECT COUNT(*) n FROM reservations WHERE status='ACTIVE' AND kind='PUT_COLLATERAL'"
+    ).fetchone()["n"]
+
+
+def _mech_step(journal, step):
+    for row in journal.events("MECHANICS_STEP"):
+        payload = json.loads(row["payload"])
+        if payload.get("step") == step:
+            return payload
+    return None
+
+
+def test_price_walk_bounds_and_config_hash():
+    assert Config(ROOT).config_hash == "2df03f83726ac139"
+    assert MT._sell_price_walk(0.40) == [0.40, 0.20, 0.01]
+    assert MT._sell_price_walk(0.05) == [0.05, 0.01]
+    assert MT._buy_price_walk(0.05) == [0.05, 0.10, 0.25]
+    assert MT._buy_price_walk(0.20) == [0.20, 0.25]
+    assert MT._buy_price_walk(0.50) == [0.25]
+    assert MT._buy_price_walk(1.0) == [0.25]
+    for ask in (0.01, 0.04, 0.05, 0.11, 0.2, 0.25, 0.3, 0.5, 2.0):
+        steps = MT._buy_price_walk(ask)
+        assert 1 <= len(steps) <= MC.PRICE_WALK_MAX_STEPS
+        assert steps[-1] <= MC.BUYBACK_MAX_PRICE
+        assert max(steps) <= MC.BUYBACK_MAX_PRICE
+    for bid in (0.02, 0.05, 0.11, 0.4, 1.0):
+        steps = MT._sell_price_walk(bid)
+        assert steps
+        assert steps[-1] == MC.SELL_PUT_FLOOR
+        assert len(steps) <= MC.PRICE_WALK_MAX_STEPS
+        assert steps == sorted(steps, reverse=True)
+
+
+def test_sell_walk_unfilled_at_bid_fills_at_floor(tmp_path, capsys):
+    clock = _clock()
+    fake = WalkBroker(clock)
+    _arm_wheel(fake)
+    fake.sell_fill_at = MC.SELL_PUT_FLOOR
+    fake.buy_fill_at = 0.0
+    slept = []
+    journal, code = _run_walk(tmp_path, fake, clock, slept.append)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "RESULT: PASS" in out
+    assert "price walk sell_put: 0.40 -> 0.20 -> 0.01" in out
+    assert _limits(fake, "sell_to_open") == ["0.40", "0.20", "0.01"]
+    assert fake.collateral_at_submit == [1, 1, 1]
+    assert fake.working_at_submit == [0, 0, 0, 0]
+    assert fake.max_option_qty == 1
+    assert option_flat(fake, _occ("F", EXP, "P", 8))
+    assert _active_collateral(journal) == 0
+    assert slept == [MC.PRICE_WALK_INTERVAL_SEC] * ((MC.PRICE_WALK_ATTEMPTS - 1) * 2)
+    gate = json.loads(open(LG.gate_path(str(tmp_path)), encoding="utf-8").read())
+    assert "wheel_sell_buyback" in gate
+    assert gate["wheel_sell_buyback"]["config_hash"] == "2df03f83726ac139"
+
+
+def test_sell_walk_never_fills_cancels_and_stays_flat(tmp_path, capsys):
+    clock = _clock()
+    fake = WalkBroker(clock)
+    _arm_wheel(fake)
+    slept = []
+    journal, code = _run_walk(tmp_path, fake, clock, slept.append)
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "RESULT: FAIL" in out
+    assert "price walk sell_put: 0.40 -> 0.20 -> 0.01" in out
+    assert "limit=0.01" in out and "status=canceled" in out and "reprices=2" in out
+    step = _mech_step(journal, "sell_put")
+    assert step["result"] == "FAIL"
+    assert step["evidence"] == "BROKER limit=0.01 status=canceled reprices=2"
+    assert step["last_limit"] == "0.01"
+    assert step["broker_status"] == "canceled"
+    assert step["reprices"] == 2
+    assert step["price_walk"] == ["0.40", "0.20", "0.01"]
+    assert _limits(fake, "sell_to_open") == ["0.40", "0.20", "0.01"]
+    assert _limits(fake, "buy_to_close") == []
+    assert fake.collateral_at_submit == [1, 1, 1]
+    assert all(n == 0 for n in fake.working_at_submit)
+    sells = [order for order in fake.book.values() if order.get("side") == "sell"]
+    assert sells and all(order["status"] == "canceled" for order in sells)
+    assert fake.positions_list == []
+    assert fake.max_option_qty == 0
+    state = json.loads(out.split("final broker state:", 1)[1].split("RESULT:", 1)[0])
+    assert state["open_orders"] == []
+    assert state["positions"] == []
+    assert _active_collateral(journal) == 0
+    assert not os.path.exists(LG.gate_path(str(tmp_path)))
+    assert slept == [MC.PRICE_WALK_INTERVAL_SEC] * ((MC.PRICE_WALK_ATTEMPTS - 1) * 3)
+
+
+def test_sell_cancel_racing_a_fill_does_not_double_sell(tmp_path, capsys):
+    clock = _clock()
+    fake = WalkBroker(clock)
+    _arm_wheel(fake)
+    fake.race_sell_cancel = True
+    fake.race_raises = True
+    fake.buy_fill_at = 0.0
+    journal, code = _run_walk(tmp_path, fake, clock, lambda _s: None)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert _limits(fake, "sell_to_open") == ["0.40"]
+    assert len({body["client_order_id"] for body in fake.submits
+                if body.get("position_intent") == "sell_to_open"}) == 1
+    assert fake.collateral_at_submit == [1]
+    assert all(n == 0 for n in fake.working_at_submit)
+    assert fake.max_option_qty == 1
+    assert option_flat(fake, _occ("F", EXP, "P", 8))
+    assert _active_collateral(journal) == 0
+    assert "0.40 -> 0.20" not in out
+    assert "price walk sell_put: 0.40" in out
+
+
+def test_buyback_walk_stops_at_cap(tmp_path, capsys):
+    clock = _clock()
+    fake = WalkBroker(clock)
+    _arm_wheel(fake)
+    occ = _occ("F", EXP, "P", 8)
+    fake.snapshots[occ]["latestQuote"]["bp"] = 0.40
+    fake.snapshots[occ]["latestQuote"]["ap"] = 0.05
+    fake.sell_fill_at = 100.0
+    slept = []
+    journal, code = _run_walk(tmp_path, fake, clock, slept.append)
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert "RESULT: FAIL" in out
+    assert "price walk buyback: 0.05 -> 0.10 -> 0.25" in out
+    assert "price walk buy_to_close: 0.05 -> 0.10 -> 0.25" in out
+    buys = [float(px) for px in _limits(fake, "buy_to_close")]
+    assert buys == [0.05, 0.10, 0.25, 0.05, 0.10, 0.25]
+    assert max(buys) == MC.BUYBACK_MAX_PRICE
+    step = _mech_step(journal, "buyback")
+    assert step["result"] == "FAIL"
+    assert step["evidence"] == "BROKER limit=0.25 status=canceled reprices=2"
+    assert "SHORT PUT STILL OPEN" in out
+    assert occ in out
+    assert all(n == 0 for n in fake.working_at_submit)
+    assert fake.max_option_qty == 1
+    assert MT.option_qty(fake.positions(), occ) == 1
+    assert _active_collateral(journal) == 1
+    state = json.loads(out.split("final broker state:", 1)[1].split("SHORT PUT", 1)[0])
+    assert state["open_orders"] == []
+    assert any(pos.get("symbol") == occ and pos.get("side") == "short" for pos in state["positions"])
+    assert not os.path.exists(LG.gate_path(str(tmp_path)))
+    assert slept == [MC.PRICE_WALK_INTERVAL_SEC] * ((MC.PRICE_WALK_ATTEMPTS - 1) * 6)
 
 
 def test_wheel_expiry_start_refusal_prints_filter_counts(tmp_path, capsys):

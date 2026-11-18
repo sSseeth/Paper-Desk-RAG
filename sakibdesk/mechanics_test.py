@@ -392,9 +392,11 @@ def _open_ids(reader, symbol):
     return sorted(order.get("id") for order in (reader.orders("open") or []) if order.get("symbol") == symbol)
 
 
-def _finish(rows, state, passed):
+def _finish(rows, state, passed, alert=""):
     _print_table(rows)
     _print_state(state)
+    if alert:
+        print(alert)
     print("RESULT:", "PASS" if passed else "FAIL")
     return 0 if passed else 2
 
@@ -912,8 +914,14 @@ def _sync_wheel(journal, om, ledger, reader):
 
 
 def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_account_id, record=True,
-                           attempts=20, interval=1.0, sleep=time.sleep):
-    """Sell one far-OTM cash-secured put and buy it back. Records on PASS."""
+                           attempts=MC.PRICE_WALK_ATTEMPTS, interval=MC.PRICE_WALK_INTERVAL_SEC,
+                           sleep=time.sleep):
+    """Sell one far-OTM cash-secured put and buy it back. Records on PASS.
+
+    The option walk polls ``MC.PRICE_WALK_ATTEMPTS`` times at
+    ``MC.PRICE_WALK_INTERVAL_SEC``. ``attempts`` and ``interval`` stay in the
+    signature so existing callers keep working; they do not shorten that walk.
+    """
     why = _preflight(reader, writer, expected_account_id)
     if why:
         print(why)
@@ -964,10 +972,15 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
         for item in ids:
             _cancel_open(om, reader, item["id"], item.get("cid"))
     state = broker_snapshot(reader, [underlying, occ])
-    flat = option_qty(reader.positions(), occ) == 0 and not [
+    short = option_qty(reader.positions(), occ)
+    flat = short == 0 and not [
         order for order in state["open_orders"] if order.get("symbol") == occ]
     passed = bool(rows) and all(row["result"] == "PASS" for row in rows) and flat
-    code = _finish(rows, state, passed)
+    alert = ""
+    if short > 0:
+        alert = (f"SHORT PUT STILL OPEN: {occ} qty {short:g}. "
+                 "Buyback and cleanup did not flatten this short put.")
+    code = _finish(rows, state, passed, alert)
     if not passed:
         return code
     evidence = f"wheel_sell_buyback run {journal.run_id} broker fill and buyback {occ}"
@@ -977,23 +990,314 @@ def run_wheel_sell_buyback(cfg, journal, reader, writer, md, *, root, expected_a
     return 0
 
 
-def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, chosen, attempts, interval, sleep):
-    occ = chosen["symbol"]
-    limit = W.tick_round_down(chosen["bid"])
-    body = W.option_order_body(occ, "sell", limit, "sell_to_open", MC.WHEEL_CONTRACTS)
-    result = _remember(ids, om.place(
-        strategy="WHEEL", symbol=occ, purpose="SELL_PUT_OPEN", signal_key=f"put:{journal.run_id}:{occ}",
-        body=body, reservations=[("WHEEL", "PUT_COLLATERAL", chosen["need"], MC.WHEEL_UNDERLYING)],
-        cash_check=lambda db, need=chosen["need"]: C._cash_ok(db, ledger, "WHEEL", need)))
-    order = poll_order(reader, (result.get("order") or {}).get("id"), {"filled"}, attempts, interval, sleep)
-    ok = (order or {}).get("status") == "filled" and option_qty(reader.positions(), occ) > 0
-    rows.append(_row("sell_put", "PASS" if ok else "FAIL", "BROKER", order,
-                     "" if ok else "put was not filled"))
-    journal_step(journal, "sell_put", order, "BROKER", rows[-1]["result"], occ, {"strike": chosen["strike"]})
-    if not ok:
+def _distinct_prices(prices):
+    """Drop non-positive duplicates, keeping order. At most the step cap."""
+    out = []
+    for px in prices:
+        px = round(float(px), 2)
+        if px <= 0:
+            continue
+        if out and abs(out[-1] - px) < 1e-9:
+            continue
+        out.append(px)
+    if len(out) <= MC.PRICE_WALK_MAX_STEPS:
+        return out
+    # Keep the quote and the floor or cap if a ladder ever grows.
+    return [out[0], out[-1]]
+
+
+def _sell_price_walk(bid):
+    """Limits for a sell the indicative bid did not get filled.
+
+    The first price is the bid tick-rounded down. The second, when it sits
+    strictly between that price and the floor, is half of it, also
+    tick-rounded down. The last is ``MC.SELL_PUT_FLOOR`` (the minimum tick),
+    which the nickel grid would round away.
+
+    Args:
+        bid: Indicative bid per share. Not an OPRA quote.
+
+    Returns:
+        Highest limit first, at most ``MC.PRICE_WALK_MAX_STEPS`` prices.
+    """
+    floor = round(float(MC.SELL_PUT_FLOOR), 2)
+    first = W.tick_round_down(float(bid))
+    if first < floor:
+        first = floor
+    prices = [first]
+    half = W.tick_round_down(first / 2.0)
+    if floor + 1e-9 < half < first - 1e-9:
+        prices.append(half)
+    if abs(prices[-1] - floor) >= 1e-9:
+        prices.append(floor)
+    return _distinct_prices(prices)
+
+
+def _buy_price_walk(ask):
+    """Limits for a buy the indicative ask did not get filled.
+
+    Starts at the ask tick-rounded up and doubles once, then stops at
+    ``MC.BUYBACK_MAX_PRICE``. A quote already above the cap is a single
+    order at the cap. No price is above the cap.
+
+    Args:
+        ask: Indicative ask per share. Not an OPRA quote.
+
+    Returns:
+        Lowest limit first, at most ``MC.PRICE_WALK_MAX_STEPS`` prices.
+    """
+    cap = round(float(MC.BUYBACK_MAX_PRICE), 2)
+    start = W.tick_round_up(float(ask))
+    if start > cap or start <= 0:
+        start = cap
+    prices = [start]
+    doubled = min(cap, W.tick_round_up(start * 2.0))
+    if start + 1e-9 < doubled < cap - 1e-9:
+        prices.append(doubled)
+    if abs(prices[-1] - cap) >= 1e-9:
+        prices.append(cap)
+    return _distinct_prices(prices)
+
+
+def _clamp_walk_price(side, limit):
+    """Keep a sell at or above the floor and a buy at or below the cap."""
+    if side == "buy":
+        return min(round(float(limit), 2), round(float(MC.BUYBACK_MAX_PRICE), 2))
+    return max(round(float(limit), 2), round(float(MC.SELL_PUT_FLOOR), 2))
+
+
+def _format_walk(label, prices):
+    body = " -> ".join(f"{px:.2f}" for px in prices) if prices else "(none)"
+    return f"price walk {label}: {body}"
+
+
+def _walk_evidence(walk, ok):
+    """Failure rows name the last limit, the broker status, and the reprices."""
+    sent = walk["sent"]
+    order = walk["order"] or {}
+    place = walk["place"] or {}
+    status = order.get("status") or place.get("status") or "none"
+    reprices = max(0, len(sent) - 1)
+    limit_txt = f"{sent[-1]:.2f}" if sent else "none"
+    detail = f"last limit {limit_txt}; broker status {status}; reprices {reprices}"
+    if ok:
+        return "BROKER", detail
+    evidence = f"BROKER limit={limit_txt} status={status} reprices={reprices}"
+    return evidence, detail
+
+
+def _working_side(reader, symbol, side):
+    for order in reader.orders("open") or []:
+        if order.get("symbol") == symbol and order.get("side") == side:
+            return True
+    return False
+
+
+def _fresh_order(reader, order_or_id):
+    if isinstance(order_or_id, dict):
+        order_or_id = order_or_id.get("id")
+    if not order_or_id:
+        return None
+    return reader.order(order_or_id)
+
+
+def _filled_qty(order):
+    try:
+        return float((order or {}).get("filled_qty") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _position_shows_fill(reader, symbol, side):
+    """True when another order on this side would double the fill.
+
+    A sell that already opened the short, or a buy that already flattened
+    it, must not be replaced. Call this only after this walk has submitted.
+    """
+    qty = option_qty(reader.positions(), symbol)
+    if side == "sell":
+        return qty > 0
+    return qty == 0
+
+
+def _fill_visible(reader, order, symbol, side):
+    if (order or {}).get("status") == "filled" or _filled_qty(order) > 0:
+        return True
+    return _position_shows_fill(reader, symbol, side)
+
+
+def _reservation_active(journal, client_order_id):
+    if not client_order_id:
+        return False
+    row = journal.db.execute(
+        "SELECT 1 FROM reservations WHERE client_order_id=? AND status='ACTIVE' LIMIT 1",
+        (client_order_id,)).fetchone()
+    return row is not None
+
+
+def _safe_reconcile(om, reader):
+    try:
+        om.reconcile(reader)
+    except BrokerError:
         return
+
+
+def _cancel_for_replace(om, reader, journal, order, client_order_id, symbol, side):
+    """Cancel one resting order and say whether a replace is safe.
+
+    Re-reads the order and the position after the cancel. A cancel that
+    races a fill returns ``filled`` and must not be replaced. A sell replace
+    also waits until that order's reservation is released, so the next
+    submit cannot reserve the collateral twice. The writer has cancel and
+    submit, not replace, so this is cancel-then-new.
+
+    Returns:
+        ``("filled"|"clear"|"unconfirmed"|"busy"|"reserved"|"missing", order)``.
+    """
+    order = _fresh_order(reader, order) or order
+    if _fill_visible(reader, order, symbol, side):
+        _safe_reconcile(om, reader)
+        return "filled", _fresh_order(reader, order) or order
+    order_id = (order or {}).get("id")
+    if not order_id:
+        return "missing", order
+    confirmed = None
+    try:
+        confirmed = _cancel_open(om, reader, order_id, client_order_id)
+    except BrokerError:
+        # The fill can win the race and make cancel raise. The re-read below
+        # decides; a second sell or buy is not submitted from this branch.
+        confirmed = None
+    order = _fresh_order(reader, order_id) or confirmed or order
+    if _fill_visible(reader, order, symbol, side):
+        _safe_reconcile(om, reader)
+        return "filled", _fresh_order(reader, order) or order
+    status = (order or {}).get("status")
+    if status not in ("canceled", "expired", "rejected"):
+        return "unconfirmed", order
+    _safe_reconcile(om, reader)
+    order = _fresh_order(reader, order_id) or order
+    if _fill_visible(reader, order, symbol, side):
+        return "filled", order
+    if _working_side(reader, symbol, side):
+        return "busy", order
+    if side == "sell" and _reservation_active(journal, client_order_id):
+        return "reserved", order
+    return "clear", order
+
+
+def _walk_result(sent, order, place, settled):
+    return {"sent": list(sent), "order": order, "place": place, "settled": settled}
+
+
+def _walk_option(journal, om, reader, ids, *, symbol, side, intent, purpose, signal_key,
+                 prices, reservations, cash_check, label, sleep):
+    """Submit one limit at a time, walking ``prices`` until one fills.
+
+    Never more than one order on ``side`` is working. Each unfilled limit
+    is cancel-confirmed before the next price. Polls use the mechanics
+    constants, not the caller's shorter budget.
+    """
+    sent = []
+    last_order = None
+    last_place = None
+    if side == "sell" and option_qty(reader.positions(), symbol) > 0:
+        print(_format_walk(label, sent))
+        return _walk_result(sent, None, None, False)
+    if side == "buy" and option_qty(reader.positions(), symbol) == 0:
+        print(_format_walk(label, sent))
+        return _walk_result(sent, None, None, True)
+
+    for index, raw in enumerate(prices):
+        limit = _clamp_walk_price(side, raw)
+        if sent and abs(sent[-1] - limit) < 1e-9:
+            continue
+        if _working_side(reader, symbol, side):
+            break
+        prev_cid = (last_place or {}).get("client_order_id")
+        if side == "sell" and prev_cid and _reservation_active(journal, prev_cid):
+            break
+        if sent and _fill_visible(reader, last_order, symbol, side):
+            print(_format_walk(label, sent))
+            return _walk_result(sent, last_order, last_place, True)
+        print(f"price walk {label} step {len(sent) + 1}/{len(prices)}: limit {limit:.2f}")
+        body = W.option_order_body(symbol, side, limit, intent, MC.WHEEL_CONTRACTS)
+        last_place = om.place(
+            strategy="WHEEL", symbol=symbol, purpose=purpose, signal_key=signal_key,
+            body=body, reservations=reservations, cash_check=cash_check, attempt=index)
+        sent.append(limit)
+        if last_place.get("status") in ("BLOCKED", "DUPLICATE", "rejected", "DRY_RUN"):
+            break
+        order_id = (last_place.get("order") or {}).get("id")
+        if not order_id:
+            break
+        _remember(ids, last_place)
+        last_order = poll_order(
+            reader, order_id, {"filled"}, MC.PRICE_WALK_ATTEMPTS, MC.PRICE_WALK_INTERVAL_SEC, sleep)
+        if _fill_visible(reader, last_order, symbol, side):
+            last_order = _fresh_order(reader, last_order) or last_order
+            print(_format_walk(label, sent))
+            return _walk_result(sent, last_order, last_place, True)
+        kind, last_order = _cancel_for_replace(
+            om, reader, journal, last_order or last_place.get("order"),
+            last_place.get("client_order_id"), symbol, side)
+        if kind == "filled":
+            print(_format_walk(label, sent))
+            return _walk_result(sent, last_order, last_place, True)
+        if kind != "clear":
+            break
+    print(_format_walk(label, sent))
+    return _walk_result(sent, last_order, last_place, False)
+
+
+def _record_walk_row(rows, journal, step, symbol, walk, ok, fail_prefix, extra):
+    evidence, detail = _walk_evidence(walk, ok)
+    line = _format_walk(step, walk["sent"])
+    note = line if ok else f"{fail_prefix}; {line}; {detail}"
+    order = walk["order"]
+    rows.append(_row(step, "PASS" if ok else "FAIL", evidence, order, note))
+    place = walk["place"] or {}
+    status = (order or {}).get("status") or place.get("status") or "none"
+    payload = {
+        "price_walk": [f"{px:.2f}" for px in walk["sent"]],
+        "reprices": max(0, len(walk["sent"]) - 1),
+        "broker_status": status,
+        "last_limit": f"{walk['sent'][-1]:.2f}" if walk["sent"] else "none",
+    }
+    if extra:
+        payload.update(extra)
+    journal_step(journal, step, order, evidence, "PASS" if ok else "FAIL", symbol, payload)
+
+
+def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, chosen, attempts, interval, sleep):
+    """Sell the put, then buy it back, walking off the indicative quote.
+
+    ``attempts`` and ``interval`` are unused. The walk polls
+    ``MC.PRICE_WALK_ATTEMPTS`` times so a short caller budget cannot leave
+    the indicative price working.
+    """
+    del attempts, interval
+    occ = chosen["symbol"]
+    need = chosen["need"]
+    sell = _walk_option(
+        journal, om, reader, ids, symbol=occ, side="sell", intent="sell_to_open",
+        purpose="SELL_PUT_OPEN", signal_key=f"put:{journal.run_id}:{occ}",
+        prices=_sell_price_walk(chosen["bid"]),
+        reservations=[("WHEEL", "PUT_COLLATERAL", need, MC.WHEEL_UNDERLYING)],
+        cash_check=lambda db, need=need: C._cash_ok(db, ledger, "WHEEL", need),
+        label="sell_put", sleep=sleep)
+    order = sell["order"]
+    held = option_qty(reader.positions(), occ)
+    ok = (order or {}).get("status") == "filled" and held > 0
+    _record_walk_row(rows, journal, "sell_put", occ, sell, ok, "put was not filled",
+                     {"strike": chosen["strike"]})
+    if not ok:
+        if held > 0:
+            flatten["occ"] = occ
+        return
+    place = sell["place"] or {}
     cycle = _open_cycle(journal, MC.WHEEL_UNDERLYING, occ, chosen["strike"], chosen["expiry"],
-                        result.get("client_order_id"), chosen["need"], "PUT_SUBMITTED")
+                        place.get("client_order_id"), need, "PUT_SUBMITTED")
     flatten["occ"] = occ
     flatten["cycle_id"] = cycle["cycle_id"]
     _sync_wheel(journal, om, ledger, reader)
@@ -1005,37 +1309,56 @@ def _sell_and_buyback(cfg, journal, om, ledger, reader, md, ids, rows, flatten, 
     try:
         ask = float(quote["ap"])
     except (KeyError, TypeError, ValueError):
-        rows.append(_row("buyback", "FAIL", "BROKER", None, "no ask to buy the put back"))
+        print("price walk buyback: (none)")
+        rows.append(_row(
+            "buyback", "FAIL", "BROKER limit=none status=none reprices=0", None,
+            "no ask to buy the put back; price walk buyback: (none); "
+            "last limit none; broker status none; reprices 0"))
+        journal_step(journal, "buyback", None, "BROKER limit=none status=none reprices=0", "FAIL", occ, {
+            "last_limit": "none", "broker_status": "none", "reprices": 0, "price_walk": [],
+        })
         return
-    buy = W.option_order_body(occ, "buy", W.tick_round_up(ask), "buy_to_close", MC.WHEEL_CONTRACTS)
-    closed = _remember(ids, om.place(
-        strategy="WHEEL", symbol=occ, purpose="BUY_TO_CLOSE", signal_key=f"buyback:{journal.run_id}:{occ}",
-        body=buy, reservations=[]))
-    if closed.get("status") in ("BLOCKED", "DUPLICATE", "rejected", "DRY_RUN"):
-        rows.append(_row("buyback", "FAIL", "BROKER", None, f"buyback {closed.get('status')}"))
-        return
-    C.set_state(journal, cycle, "BUYBACK_SUBMITTED", pending_cid=closed.get("client_order_id"))
-    seen = poll_order(reader, (closed.get("order") or {}).get("id"), {"filled"}, attempts, interval, sleep)
+    buy = _walk_option(
+        journal, om, reader, ids, symbol=occ, side="buy", intent="buy_to_close",
+        purpose="BUY_TO_CLOSE", signal_key=f"buyback:{journal.run_id}:{occ}",
+        prices=_buy_price_walk(ask), reservations=[], cash_check=None,
+        label="buyback", sleep=sleep)
+    seen = buy["order"]
+    if (buy["place"] or {}).get("status") not in ("BLOCKED", "DUPLICATE", "rejected", "DRY_RUN"):
+        if buy["place"] and cycle["state"] == "PUT_OPEN":
+            C.set_state(journal, cycle, "BUYBACK_SUBMITTED", pending_cid=buy["place"].get("client_order_id"))
     _sync_wheel(journal, om, ledger, reader)
     flat = option_qty(reader.positions(), occ) == 0 and (seen or {}).get("status") == "filled"
-    rows.append(_row("buyback", "PASS" if flat else "FAIL", "BROKER", seen,
-                     "" if flat else "buyback was not filled"))
-    journal_step(journal, "buyback", seen, "BROKER", rows[-1]["result"], occ)
+    blocked = (buy["place"] or {}).get("status")
+    if blocked in ("BLOCKED", "DUPLICATE", "rejected", "DRY_RUN"):
+        prefix = f"buyback {blocked}"
+    else:
+        prefix = "buyback was not filled"
+    _record_walk_row(rows, journal, "buyback", occ, buy, flat, prefix, None)
     if flat:
         flatten["occ"] = None
 
 
 def _buy_to_close(journal, om, reader, md, ids, occ, attempts, interval, sleep):
+    """Buy the short put back, walking the indicative ask up to the cap.
+
+    ``attempts`` and ``interval`` are unused; the walk uses the mechanics
+    poll window. A still-open short is left for the caller to report.
+    """
+    del attempts, interval
+    if option_qty(reader.positions(), occ) <= 0:
+        return None
     quote = _option_snapshot(md, occ)
     try:
         ask = float(quote["ap"])
     except (KeyError, TypeError, ValueError):
         return None
-    body = W.option_order_body(occ, "buy", W.tick_round_up(ask), "buy_to_close", MC.WHEEL_CONTRACTS)
-    result = _remember(ids, om.place(
-        strategy="WHEEL", symbol=occ, purpose="BUY_TO_CLOSE", signal_key=f"cleanup:{journal.run_id}:{occ}",
-        body=body, reservations=[]))
-    return poll_order(reader, (result.get("order") or {}).get("id"), {"filled"}, attempts, interval, sleep)
+    walk = _walk_option(
+        journal, om, reader, ids, symbol=occ, side="buy", intent="buy_to_close",
+        purpose="BUY_TO_CLOSE", signal_key=f"cleanup:{journal.run_id}:{occ}",
+        prices=_buy_price_walk(ask), reservations=[], cash_check=None,
+        label="buy_to_close", sleep=sleep)
+    return walk["order"]
 
 
 def run_wheel_expiry(cfg, journal, reader, writer, md, *, root, expected_account_id, action,
