@@ -66,14 +66,22 @@ def transition(state, event):
     return TRANSITIONS[k]
 
 
+# OPASN is assignment. OPEXC is exercise. Both confirm the short option was
+# closed by assignment or exercise. OPXRC is not an Alpaca activity type.
+ASSIGNMENT_ACTIVITY_TYPES = ("OPASN", "OPEXC")
+
+
 def classify_option_outcome(occ_symbol, held_before, positions, activities):
     """Decide what happened to a short option using ONLY broker positions + REST activities.
     Never infer assignment from price. Returns one of: STILL_OPEN, ASSIGNMENT_CONFIRMED, EXPIRED_CONFIRMED,
-    OPTION_POSITION_GONE_UNEXPLAINED, CLOSED_BY_FILL (handled by order reconciliation)."""
+    OPTION_POSITION_GONE_UNEXPLAINED, CLOSED_BY_FILL (handled by order reconciliation).
+
+    OPASN (assignment) and OPEXC (exercise) both return ASSIGNMENT_CONFIRMED.
+    OPEXP returns EXPIRED_CONFIRMED. The main wheel reconcile uses this."""
     if any(p["symbol"] == occ_symbol and float(p["qty"]) != 0 for p in positions):
         return "STILL_OPEN"
     acts = [a for a in activities if a.get("symbol") == occ_symbol]
-    if any(a.get("activity_type") in ("OPASN", "OPXRC") for a in acts):
+    if any(a.get("activity_type") in ASSIGNMENT_ACTIVITY_TYPES for a in acts):
         return "ASSIGNMENT_CONFIRMED"
     if any(a.get("activity_type") == "OPEXP" for a in acts):
         return "EXPIRED_CONFIRMED"
@@ -218,6 +226,9 @@ def mock_paths_pass():
         opasn = [{"symbol": "X", "activity_type": "OPASN"}]
         if classify_option_outcome("X", True, [], opasn) != "ASSIGNMENT_CONFIRMED":
             return False, "OPASN was not treated as assignment"
+        opexc = [{"symbol": "X", "activity_type": "OPEXC"}]
+        if classify_option_outcome("X", True, [], opexc) != "ASSIGNMENT_CONFIRMED":
+            return False, "OPEXC was not treated as exercise"
         opexp = [{"symbol": "X", "activity_type": "OPEXP"}]
         if classify_option_outcome("X", True, [], opexp) != "EXPIRED_CONFIRMED":
             return False, "OPEXP was not treated as expiry"

@@ -7,6 +7,48 @@ from sakibdesk.secrets_store import redact
 from sakibdesk.config import Config
 
 
+def test_default_activity_types_are_in_the_documented_allowlist():
+    """Every type activities() requests is in Alpaca's ActivityTypeFilter.
+
+    OPXRC is not a documented type and must not be requested. Exercise is
+    OPEXC. The main wheel reconcile uses this default set.
+    """
+    defaults = A.PaperReader.activities.__defaults__[0]
+    assert defaults == A.DEFAULT_ACTIVITY_TYPES
+    assert defaults == ("OPASN", "OPEXP", "OPEXC", "OPTRD", "FILL")
+    for name in defaults:
+        assert name in A.ACTIVITY_TYPE_ALLOWLIST
+    for name in ("OPASN", "OPEXP", "OPEXC", "OPTRD", "OPCA", "OPCSH", "FILL"):
+        assert name in A.ACTIVITY_TYPE_ALLOWLIST
+    assert "OPXRC" not in A.ACTIVITY_TYPE_ALLOWLIST
+    assert "OPXRC" not in defaults
+
+
+def test_activities_requests_only_documented_types():
+    seen = {}
+
+    def fn(url, params):
+        seen["url"] = url
+        seen["params"] = params
+        return 200, []
+
+    out = A.PaperReader("k", "s", session=Rec(fn)).activities()
+    assert out == []
+    assert seen["url"].endswith("/v2/account/activities")
+    requested = seen["params"]["activity_types"].split(",")
+    assert requested == list(A.DEFAULT_ACTIVITY_TYPES)
+    assert set(requested) <= set(A.ACTIVITY_TYPE_ALLOWLIST)
+    assert "OPXRC" not in requested
+
+
+def test_activities_refuses_an_undocumented_type_before_the_request():
+    def fn(_url, _params):
+        raise AssertionError("undocumented activity type was requested")
+
+    with pytest.raises(A.BrokerError, match="OPXRC"):
+        A.PaperReader("k", "s", session=Rec(fn)).activities(types=("OPASN", "OPXRC"))
+
+
 def test_hosts_hard_coded():
     assert A.PAPER_TRADING_HOST == "https://paper-api.alpaca.markets" and A.DATA_HOST == "https://data.alpaca.markets"
     import inspect

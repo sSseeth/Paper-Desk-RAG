@@ -325,7 +325,7 @@ HELD_LOT_STATES = ("SHARES_HELD", "CALL_PENDING", "CALL_OPEN", "CALL_CLOSING", "
 
 def _assigned_lots_and_coverage(j, raw_pos, option_positions):
     """Assigned share lots from the wheel state machine (cycles that reached SHARES_HELD via a confirmed
-    OPASN/OPXRC assignment carry acquisition_price), valued at max(cost, market), plus covered-call coverage."""
+    OPASN assignment or OPEXC exercise carry acquisition_price), valued at max(cost, market), plus covered-call coverage."""
     eq = {p["symbol"]: p for p in raw_pos if p.get("asset_class") == "us_equity" or
           (p.get("asset_class") is None and len(p.get("symbol") or "") <= 6)}
     stock_qty = {}

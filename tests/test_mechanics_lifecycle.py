@@ -875,6 +875,106 @@ def test_buyback_walk_stops_at_cap(tmp_path, capsys):
     assert slept == [MC.PRICE_WALK_INTERVAL_SEC] * ((MC.PRICE_WALK_ATTEMPTS - 1) * 6)
 
 
+class ActivityFailureBroker(WalkBroker):
+    """activities() answers 422. The first cancel leaves its order working."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.events = []
+        self._cancel_n = 0
+
+    def activities(self, *args, **kwargs):
+        self.events.append("activities")
+        raise BrokerError(
+            'GET /v2/account/activities: HTTP 422 '
+            '{"code":40010001,"message":"invalid activity type: OPXRC"}')
+
+    def cancel(self, oid):
+        self.events.append(("cancel", oid))
+        self._cancel_n += 1
+        if self._cancel_n == 1:
+            raise BrokerError("cancel raced")
+        super().cancel(oid)
+
+
+def test_activities_422_during_cleanup_still_cancels_and_reports(tmp_path, capsys):
+    clock = _clock()
+    fake = ActivityFailureBroker(clock)
+    _arm_wheel(fake)
+    fake.sell_fill_at = 100.0
+    fake.buy_fill_at = None
+    _journal, code = _run_walk(tmp_path, fake, clock, lambda _s: None)
+    captured = capsys.readouterr()
+    out, err = captured.out, captured.err
+    assert code == 2, out
+    assert "Traceback" not in out and "Traceback" not in err
+    assert "final broker state:" in out
+    assert "RESULT: FAIL" in out
+    assert "SHORT PUT STILL OPEN" in out
+    last_act = max(i for i, event in enumerate(fake.events) if event == "activities")
+    assert any(isinstance(event, tuple) and event[0] == "cancel" for event in fake.events[last_act + 1:])
+    state = json.loads(out.split("final broker state:", 1)[1].split("SHORT PUT", 1)[0])
+    assert state["open_orders"] == []
+    occ = _occ("F", EXP, "P", 8)
+    assert any(pos.get("symbol") == occ and pos.get("side") == "short" for pos in state["positions"])
+    assert not os.path.exists(LG.gate_path(str(tmp_path)))
+
+
+def test_leftover_short_put_recovers_without_a_new_sell(tmp_path, capsys):
+    cfg = Config(ROOT)
+    clock = _clock()
+    journal = _journal(tmp_path, cfg, clock)
+    fake = WalkBroker(clock)
+    _arm_wheel(fake)
+    occ = _occ("F", EXP, "P", 11)
+    fake.positions_list.append({
+        "symbol": occ, "qty": "1", "side": "short", "asset_class": "us_option",
+    })
+    fake.snapshots[occ] = _quote_for(occ, 0.10, 0.40)
+    fake.buy_fill_at = 0.40
+    stale = {
+        "id": "STALE-1",
+        "client_order_id": "stale-buy",
+        "status": "new",
+        "symbol": occ,
+        "side": "buy",
+        "qty": "1",
+        "type": "limit",
+        "limit_price": "0.15",
+        "filled_qty": "0",
+        "filled_avg_price": None,
+        "submitted_at": "2026-11-16T15:00:00Z",
+        "asset_class": "us_option",
+    }
+    fake.book[stale["id"]] = stale
+    fake.by_cid[stale["client_order_id"]] = stale
+    code = MT.run_wheel_sell_buyback(
+        cfg, journal, fake, fake, fake, root=str(tmp_path), expected_account_id="MECH-1",
+        record=True, attempts=1, interval=0, sleep=lambda _s: None)
+    out = capsys.readouterr().out
+    assert code == 2, out
+    assert "A new put was not opened." in out
+    assert "cancel-confirmed" in out
+    assert "cap 1.00" in out
+    assert "Nothing was recorded." in out
+    assert "Re-run wheel-sell-buyback after this account is flat." in out
+    assert "final broker state:" in out
+    assert "RESULT: FAIL" in out
+    assert "chosen far put" not in out
+    sells = [body for body in fake.submits if body.get("position_intent") == "sell_to_open"]
+    buys = [body for body in fake.submits if body.get("position_intent") == "buy_to_close"]
+    assert sells == []
+    assert buys and float(buys[0]["limit_price"]) == 0.40
+    assert all(float(body["limit_price"]) <= MC.BUYBACK_ABS_MAX + 1e-9 for body in buys)
+    assert fake.cancels[0] == "STALE-1"
+    assert fake.order("STALE-1")["status"] == "canceled"
+    assert option_flat(fake, occ)
+    assert not os.path.exists(LG.gate_path(str(tmp_path)))
+    assert journal.db.execute("SELECT COUNT(*) n FROM wheel_cycles").fetchone()["n"] == 0
+    assert list(journal.events("MECHANICS_STEP")) == []
+    assert Config(ROOT).config_hash == "2df03f83726ac139"
+
+
 def test_buyback_cap_math_and_config_hash():
     assert Config(ROOT).config_hash == "2df03f83726ac139"
     assert MT._buyback_cap(None) == MC.BUYBACK_MAX_PRICE

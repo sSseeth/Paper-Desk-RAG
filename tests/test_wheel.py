@@ -33,6 +33,8 @@ def test_invalid_transitions_raise(st, ev):
 def test_assignment_never_inferred_from_price():
     assert W.classify_option_outcome("MU261204P00150000", True, [], []) == "OPTION_POSITION_GONE_UNEXPLAINED"
     assert W.classify_option_outcome("X", True, [], [{"symbol": "X", "activity_type": "OPASN"}]) == "ASSIGNMENT_CONFIRMED"
+    assert W.classify_option_outcome("X", True, [], [{"symbol": "X", "activity_type": "OPEXC"}]) == "ASSIGNMENT_CONFIRMED"
+    assert "OPEXC" in W.ASSIGNMENT_ACTIVITY_TYPES and "OPXRC" not in W.ASSIGNMENT_ACTIVITY_TYPES
     assert W.classify_option_outcome("X", True, [], [{"symbol": "X", "activity_type": "OPEXP"}]) == "EXPIRED_CONFIRMED"
 
 

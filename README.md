@@ -139,6 +139,8 @@ py desk.py mechanics-test --account mechanics --suite wheel-sell-buyback
 
 This sells one far-OTM put on the nearest weekly with at least 1 day to expiry, buys it back, and on PASS records `wheel_sell_buyback`.
 
+If that account already holds a short put on `F`, or has an open `F` option order, the suite does not sell another put. It cancel-confirms the open `F` option orders, buys the short put back with the same walk (never above $1.00 per share), prints the final broker state, and exits without recording. Re-run the suite once the account is flat.
+
 ```powershell
 .\.venv\Scripts\Activate.ps1
 py desk.py mechanics-test --account mechanics --suite wheel-expiry --start
@@ -151,7 +153,7 @@ This sells one near-expiry, slightly in-the-money put and stores the intent in t
 py desk.py mechanics-test --account mechanics --suite wheel-expiry --reconcile
 ```
 
-Run that on later days. It reads broker activities. An option that disappears without `OPASN`, `OPXRC`, or `OPEXP` is `MOCK` and does not record `wheel_lifecycle`. An `OPASN` or `OPXRC` assignment is `OBSERVED_PAPER_ASSIGNMENT`: the run checks that 100 shares are reserved, sells a covered call, and a later reconcile records `wheel_lifecycle` only after that call's delivery or expiry is observed. A mock transition is not full verification.
+Run that on later days. It reads broker activities. An option that disappears without `OPASN`, `OPEXC`, or `OPEXP` is `MOCK` and does not record `wheel_lifecycle`. An `OPASN` assignment or an `OPEXC` exercise is `OBSERVED_PAPER_ASSIGNMENT`: the run checks that 100 shares are reserved, sells a covered call, and a later reconcile records `wheel_lifecycle` only after that call's delivery or expiry is observed. A mock transition is not full verification.
 
 ## Commands
 
