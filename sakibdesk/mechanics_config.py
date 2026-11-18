@@ -29,6 +29,22 @@ MIN_DTE = 1
 SELL_BUYBACK_MAX_DTE = 21
 EXPIRY_MAX_DTE = 10
 
+# Indicative option quotes are not OPRA. A far put's bid can sit above the
+# price the paper broker will sell, and the ask can sit below the price it
+# will buy. The sell walks down to this premium per share.
+SELL_PUT_FLOOR = 0.01
+# Hard cap for a buy-to-close, premium per share. One contract costs
+# BUYBACK_MAX_PRICE * 100 dollars. The walk never bids above this.
+BUYBACK_MAX_PRICE = 0.25
+# Polls of one resting limit before cancel-and-replace, and the seconds
+# between those polls. Giving up at 20 seconds left the indicative bid
+# working with status `new`.
+PRICE_WALK_ATTEMPTS = 30
+PRICE_WALK_INTERVAL_SEC = 1.0
+# At most three limits: the quote, half the bid or double the ask, then
+# the floor or the cap.
+PRICE_WALK_MAX_STEPS = 3
+
 OBSERVED_ASSIGNMENT = "OBSERVED_PAPER_ASSIGNMENT"
 MOCK_EVIDENCE = "MOCK"
 SERIES = "mechanics-test"
