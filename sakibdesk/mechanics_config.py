@@ -20,9 +20,12 @@ WHEEL_UNDERLYING = "F"
 WHEEL_CONTRACTS = 1
 WHEEL_MAX_STRIKE = 30.0
 
-# Nearest OTM strike at or below this fraction of the bid. Farther strikes on
-# a low-priced name often have a zero bid on the indicative feed, so the
-# mechanics selector stops at 90% of spot and keeps the first positive bid.
+# Far OTM is a preference. On the nearest expiry with a sellable bid, the
+# highest strike at or below this fraction of the spot bid is the first
+# choice. The sell-buyback suite closes the put at once, so a nearer strike
+# that is still below the spot bid is acceptable when that region has no
+# sellable quote. Indicative bids on a low-priced name are often empty
+# that far out.
 FAR_OTM_FRACTION = 0.90
 ITM_FRACTION = 1.01
 MIN_DTE = 1
@@ -33,9 +36,21 @@ EXPIRY_MAX_DTE = 10
 # price the paper broker will sell, and the ask can sit below the price it
 # will buy. The sell walks down to this premium per share.
 SELL_PUT_FLOOR = 0.01
-# Hard cap for a buy-to-close, premium per share. One contract costs
-# BUYBACK_MAX_PRICE * 100 dollars. The walk never bids above this.
+# One nickel. Under $3 the indicative grid rounds a bid below this down to
+# 0, so the quote cannot be sold. The counts line keeps those quotes in
+# "positive bid" and out of "sellable bid".
+MIN_SELLABLE_BID = 0.05
+# Floor of the buy-to-close cap, premium per share. The walk uses this when
+# the opening fill plus BUYBACK_EXTRA_OVER_SOLD is lower.
 BUYBACK_MAX_PRICE = 0.25
+# Added to the broker's filled average of the opening sell.
+BUYBACK_EXTRA_OVER_SOLD = 0.25
+# Absolute ceiling of the buy-to-close cap, premium per share.
+# cap = min(max(BUYBACK_MAX_PRICE, sold_fill + BUYBACK_EXTRA_OVER_SOLD),
+#           BUYBACK_ABS_MAX).
+# One contract at this ceiling costs 100 dollars. The opening credit keeps
+# the loss on that contract under 100 dollars. Paper only.
+BUYBACK_ABS_MAX = 1.00
 # Polls of one resting limit before cancel-and-replace, and the seconds
 # between those polls. Giving up at 20 seconds left the indicative bid
 # working with status `new`.
