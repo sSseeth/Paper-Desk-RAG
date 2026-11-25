@@ -23,7 +23,12 @@ class CredentialsMissing(RuntimeError):
 
 
 class Bar:
-    """One split-adjusted daily bar. `date` is the session date."""
+    """One daily bar. `date` is the session date.
+
+    The primary cache is split-adjusted, matching the live books. A raw bar
+    is the unadjusted print used for option strikes. A total-return bar is
+    split- and dividend-adjusted and is used only for benchmarks.
+    """
 
     __slots__ = ("date", "o", "h", "l", "c", "v")
 
@@ -36,20 +41,56 @@ class Bar:
         self.v = v
 
 
-class History:
-    """Bars for one symbol, sorted by session date, one row per date."""
+def _index(bars):
+    ordered = sorted(bars or [], key=lambda b: b.date)
+    dedup = {}
+    for bar in ordered:
+        dedup[bar.date] = bar
+    rows = [dedup[d] for d in sorted(dedup)]
+    return rows, [b.date for b in rows], {b.date: b for b in rows}
 
-    def __init__(self, bars):
-        ordered = sorted(bars, key=lambda b: b.date)
-        dedup = {}
-        for bar in ordered:
-            dedup[bar.date] = bar
-        self.bars = [dedup[d] for d in sorted(dedup)]
-        self.dates = [b.date for b in self.bars]
-        self.by_date = {b.date: b for b in self.bars}
+
+class History:
+    """Bars for one symbol, sorted by session date, one row per date.
+
+    `raw_bars` are unadjusted prices. `total_bars` are dividend-adjusted.
+    Both are optional. Indicators stay on the primary (split-adjusted) series.
+    """
+
+    def __init__(self, bars, raw_bars=None, total_bars=None):
+        self.bars, self.dates, self.by_date = _index(bars)
+        _raw, _raw_dates, self.raw_by_date = _index(raw_bars)
+        _total, _total_dates, self.total_by_date = _index(total_bars)
+        self.has_raw = bool(self.raw_by_date)
+        self.has_total = bool(self.total_by_date)
 
     def on(self, day):
         return self.by_date.get(day)
+
+    def raw_on(self, day):
+        return self.raw_by_date.get(day)
+
+    def total_on(self, day):
+        return self.total_by_date.get(day)
+
+    def split_factor(self, day, field="c"):
+        """Unadjusted price divided by the split-adjusted price.
+
+        A factor of 1 means no later split is in the adjustment, or that no
+        raw series was loaded. A factor of 10 means a later 10-for-1 (or a
+        stack of splits) has divided the adjusted price by 10.
+        """
+        if not self.has_raw:
+            return 1.0
+        adj = self.on(day)
+        raw = self.raw_on(day)
+        if adj is None or raw is None:
+            return 1.0
+        adj_px = adj.o if field == "o" else adj.c
+        raw_px = raw.o if field == "o" else raw.c
+        if adj_px <= 0 or raw_px <= 0:
+            return 1.0
+        return raw_px / adj_px
 
     def slice(self, start, end_exclusive):
         import bisect
@@ -116,11 +157,22 @@ def write_csv(path, bars):
             writer.writerow([bar.date, bar.o, bar.h, bar.l, bar.c, int(bar.v)])
 
 
+def raw_cache_dir(cache_dir):
+    """Unadjusted bars. Option collateral uses these, not the split series."""
+    return os.path.join(cache_dir, "raw")
+
+
+def total_cache_dir(cache_dir):
+    """Split- and dividend-adjusted bars. Benchmarks only."""
+    return os.path.join(cache_dir, "total")
+
+
 def load_cache(cache_dir, symbols):
     """Return ({symbol: History}, [missing symbols]).
 
-    A symbol with no rows is missing. The caller decides whether that blocks
-    the run. This function does not open a network connection.
+    A symbol with no split-adjusted rows is missing. Raw and total-return
+    files are attached when they exist and are otherwise omitted. This
+    function does not open a network connection.
     """
     found, missing = {}, []
     for symbol in symbols:
@@ -128,7 +180,9 @@ def load_cache(cache_dir, symbols):
         if not bars:
             missing.append(symbol)
             continue
-        found[symbol] = History(bars)
+        raw = load_csv(cache_path(raw_cache_dir(cache_dir), symbol))
+        total = load_csv(cache_path(total_cache_dir(cache_dir), symbol))
+        found[symbol] = History(bars, raw_bars=raw or None, total_bars=total or None)
     return found, missing
 
 
@@ -167,9 +221,14 @@ def bars_from_alpaca(rows):
 
 
 def fetch_cache(root, symbols, start, end, cache_dir):
-    """Fetch split-adjusted daily bars into the CSV cache.
+    """Fetch daily bars into the CSV cache.
 
-    Uses the read-only Alpaca market-data bars endpoint through MarketData.
+    Three series are stored, all from the read-only bars endpoint:
+
+    - split-adjusted, in `cache_dir`, for signals (the live adjustment)
+    - raw, in `cache_dir/raw`, for option strikes and collateral
+    - adjustment `all`, in `cache_dir/total`, for dividend-adjusted benchmarks
+
     No trading client is constructed and the account id is not read.
 
     Credentials are the main profile's key id and secret from secrets_store.get,
@@ -177,7 +236,8 @@ def fetch_cache(root, symbols, start, end, cache_dir):
     then the user-only secrets file. A missing key raises CredentialsMissing
     before any request is made.
 
-    Returns ({symbol: number of bars}, [symbols that came back empty]).
+    Returns ({symbol: number of split-adjusted bars}, [symbols whose split
+    series came back empty]).
     """
     from sakibdesk.alpaca import MarketData
     from sakibdesk.config import Config
@@ -196,20 +256,29 @@ def fetch_cache(root, symbols, start, end, cache_dir):
     feed = cfg.feeds["stock_feed"]
     option_feed = cfg.feeds["option_feed"]
     client = MarketData(key_id, secret, feed, option_feed)
+    series = (
+        ("split", cache_dir),
+        ("raw", raw_cache_dir(cache_dir)),
+        ("all", total_cache_dir(cache_dir)),
+    )
     written, empty = {}, []
     try:
         for symbol in symbols:
-            try:
-                payload = client.daily_bars([symbol], start)
-            except Exception as exc:
-                raise RuntimeError(redact(str(exc))) from None
-            rows = (payload or {}).get(symbol) or []
-            bars = [b for b in bars_from_alpaca(rows) if start <= b.date <= end]
-            if not bars:
-                empty.append(symbol)
-                continue
-            write_csv(cache_path(cache_dir, symbol), bars)
-            written[symbol] = len(bars)
+            for adjustment, folder in series:
+                try:
+                    payload = client.daily_bars([symbol], start, adjustment=adjustment)
+                except Exception as exc:
+                    raise RuntimeError(redact(str(exc))) from None
+                rows = (payload or {}).get(symbol) or []
+                bars = [b for b in bars_from_alpaca(rows) if start <= b.date <= end]
+                if adjustment == "split" and not bars:
+                    empty.append(symbol)
+                    break
+                if not bars:
+                    continue
+                if adjustment == "split":
+                    written[symbol] = len(bars)
+                write_csv(cache_path(folder, symbol), bars)
     finally:
         # Drop the header values from this process's secret set by not logging
         # them. The client holds them only in memory.

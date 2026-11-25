@@ -10,6 +10,8 @@ from datetime import date, timedelta
 
 from sakibdesk.backtest import metrics as M
 from sakibdesk.backtest.data import CredentialsMissing, fetch_cache, load_cache
+from sakibdesk.backtest.candidates import fetch_symbols, resolve_strategies
+from sakibdesk.backtest.compare import run_comparison, write_comparison
 from sakibdesk.backtest.engine import BAR_LOOKBACK_DAYS, IN_SAMPLE_FRACTION, run_backtest, split_sessions
 from sakibdesk.backtest.pricing import ENTRY_HALF_SPREAD, STOCK_HALF_SPREAD
 from sakibdesk.backtest.report import (
@@ -72,7 +74,9 @@ def parse_books(text):
     return tuple(dict.fromkeys(parts))
 
 
-def symbols_for(cfg):
+def symbols_for(cfg, specs=None):
+    if specs:
+        return fetch_symbols(cfg, specs)
     names = list(cfg.us_symbols)
     if "SPY" not in names:
         names.append("SPY")
@@ -269,11 +273,20 @@ def run_cli(root, args):
     cache_dir = os.path.abspath(args.cache_dir or os.path.join(root, "data", "backtest_cache"))
     slippage = float(args.slippage_bps)
     haircut = float(args.iv_haircut)
-    names = symbols_for(cfg)
+    fractional = bool(getattr(args, "fractional", False))
+    dd_reset_flag = bool(getattr(args, "dd_reset", False))
+    try:
+        specs = resolve_strategies(getattr(args, "strategies", None))
+    except ValueError as exc:
+        print(f"backtest refused: {exc}")
+        return 2
+    names = symbols_for(cfg, specs)
 
     if args.fetch:
         warmup = (date.fromisoformat(start) - timedelta(days=BAR_LOOKBACK_DAYS)).isoformat()
-        print(f"Fetching split-adjusted daily bars {warmup} to {end} into {cache_dir}")
+        print(
+            f"Fetching split, raw, and dividend-adjusted daily bars {warmup} to {end} "
+            f"into {cache_dir}")
         try:
             written, empty = fetch_cache(root, names, warmup, end, cache_dir)
         except CredentialsMissing as exc:
@@ -294,13 +307,35 @@ def run_cli(root, args):
         print(_fetch_hint(start, end, output_dir))
         return 2
 
+    if specs is not None:
+        print(
+            f"RESEARCH comparison {start} to {end} "
+            f"candidates={len(specs)} fractional={fractional} "
+            f"dd_reset={dd_reset_flag} hash={cfg.config_hash}")
+        report = run_comparison(
+            histories, cfg, start=start, end=end, capitals=capitals, specs=specs,
+            fractional=fractional, slippage_bps=slippage, iv_haircut=haircut,
+            dd_reset_flag=dd_reset_flag,
+            walk_forward=not args.skip_walk_forward)
+        json_path, md_path = write_comparison(output_dir, report)
+        print(f"Wrote {json_path}")
+        print(f"Wrote {md_path}")
+        print(
+            f"Variants tried: {report['variants_tried']} "
+            f"(pre-declared grid {report['predeclared_candidates']}). "
+            "RESEARCH only. The paper journal was not written.")
+        _print_research(report)
+        return 0
+
     print(
         f"Backtest {start} to {end} books={','.join(books)} "
         f"slippage={slippage:g}bps iv_haircut={haircut:.0%} "
         f"hash={cfg.config_hash}")
+    dd_reset = "monthly" if dd_reset_flag else None
     common = dict(
         histories=histories, cfg=cfg, start=start, end=end, books=books,
-        slippage_bps=slippage, iv_haircut=haircut)
+        slippage_bps=slippage, iv_haircut=haircut, fractional=fractional,
+        dd_reset=dd_reset)
     runs = []
     for capital in capitals:
         print(f"  capital {capital:,.0f}")
@@ -323,7 +358,9 @@ def run_cli(root, args):
 
     walk = None
     if not args.skip_walk_forward:
-        walk = _walk_forward(runs, histories, cfg, anchor, books, slippage, haircut, start, end)
+        walk = _walk_forward(
+            runs, histories, cfg, anchor, books, slippage, haircut, start, end,
+            fractional=fractional, dd_reset=dd_reset)
 
     alerts = [n["symbol"] for n in cfg.watchlist["names"] if n.get("alerts_only")]
     report = {
@@ -352,6 +389,10 @@ def run_cli(root, args):
         "sensitivity": sensitivity,
         "walk_forward": walk,
         "headline": [headline_row(run) for run in runs],
+        "dividend_benchmarks": _dividend_flag(histories),
+        "option_price_space": _option_space(histories),
+        "fractional": fractional,
+        "dd_reset": dd_reset,
     }
     json_path, md_path = write_report(output_dir, report)
     print(f"Wrote {json_path}")
@@ -369,7 +410,31 @@ def _match(runs, capital, slippage, haircut):
     return None
 
 
-def _walk_forward(runs, histories, cfg, anchor, books, slippage, haircut, start, end):
+def _dividend_flag(histories):
+    if any(getattr(hist, "has_total", False) for hist in histories.values()):
+        return "included"
+    return "omitted"
+
+
+def _option_space(histories):
+    if any(getattr(hist, "has_raw", False) for hist in histories.values()):
+        return "unadjusted"
+    return "split_adjusted"
+
+
+def _print_research(report):
+    print(f"Headline is {report.get('walk_forward') and 'out of sample' or 'full sample'}.")
+    print(f"{'Id':<24} {'Sharpe':>8} {'CAGR':>10} {'MaxDD':>10} {'Beat SPY':>10}")
+    for row in report.get("ranked_oos") or []:
+        beat = row.get("beat_spy")
+        beat_txt = "n/a" if beat is None else ("yes" if beat else "no")
+        print(
+            f"{row['id']:<24} {_fmt(row.get('sharpe'), False):>8} "
+            f"{_fmt(row.get('cagr')):>10} {_fmt(row.get('max_drawdown')):>10} {beat_txt:>10}")
+
+
+def _walk_forward(runs, histories, cfg, anchor, books, slippage, haircut, start, end,
+                  fractional=False, dd_reset=None):
     primary = _match(runs, anchor, slippage, haircut)
     sessions = [point["date"] for point in primary["curve"]] if primary else []
     parts = split_sessions(sessions, IN_SAMPLE_FRACTION)
@@ -385,10 +450,12 @@ def _walk_forward(runs, histories, cfg, anchor, books, slippage, haircut, start,
     print(f"  walk-forward split {out_sample[0]} (out of sample starts)")
     inn = _run(
         histories=histories, cfg=cfg, start=in_sample[0], end=in_sample[-1],
-        capital=anchor, books=books, slippage_bps=slippage, iv_haircut=haircut)
+        capital=anchor, books=books, slippage_bps=slippage, iv_haircut=haircut,
+        fractional=fractional, dd_reset=dd_reset)
     out = _run(
         histories=histories, cfg=cfg, start=out_sample[0], end=out_sample[-1],
-        capital=anchor, books=books, slippage_bps=slippage, iv_haircut=haircut)
+        capital=anchor, books=books, slippage_bps=slippage, iv_haircut=haircut,
+        fractional=fractional, dd_reset=dd_reset)
     return {
         "note": note,
         "split_date": out_sample[0],

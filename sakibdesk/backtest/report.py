@@ -65,9 +65,12 @@ ASSUMPTIONS = [
     "One decision is taken per session, inside each book's entry window. "
     "Stock uses 45 minutes after the open. The wheel uses 120 minutes after the "
     "open. Stops and targets are treated as resting all day.",
-    "Shares are whole. Quantity is stock.size, which floors, and the fee loop "
-    "only steps down by one share. The wheel sells one contract. There is no "
-    "fractional share and no fractional contract.",
+    "Shares are whole unless the RESEARCH flag --fractional is set. The default "
+    "quantity is stock.size, which floors, and the fee loop only steps down by "
+    "one share. With --fractional the same three caps are kept and the quantity "
+    "is rounded to six decimal places (Alpaca equities). A fill under one "
+    "currency unit is skipped. The wheel still sells one contract. There is no "
+    "fractional contract.",
     "Commissions are the policy overlays: one currency unit per stock "
     "transaction and per option side, including expiry and assignment. The "
     "overlay is not scaled down at a small account. Slippage is basis points "
@@ -78,14 +81,23 @@ ASSUMPTIONS = [
     "equity). The percents are the policy percents. Sleeve cash starts at the "
     "policy stock/wheel ratio of the scenario capital. policy.json is not edited.",
     "The 10% experiment drawdown block and the 2% daily-loss block follow "
-    "risk.RiskState. The experiment block stays on. Exits still run.",
+    "risk.RiskState. The shipped experiment block stays on for the rest of "
+    "the sample. The RESEARCH variant --dd-reset clears it on the first "
+    "session of a later calendar month and restarts the high-water mark. "
+    "Exits still run while the block is on.",
     "A symbol the stock book holds, or bought earlier that session, is not "
     "eligible for a new wheel put that session.",
     "Walk-forward is a chronological 60/40 split with a cold start on each "
     "side. Parameters are not searched and are not refit.",
-    "Bars are split-adjusted, matching the policy, and are not dividend-adjusted. "
-    "Buy-and-hold comparisons use the same prices, so dividend income is missing "
-    "on both sides.",
+    "Stock signals use split-adjusted bars, matching the policy. Option strikes, "
+    "premiums, collateral, and the contract's share count use unadjusted bars "
+    "when cache_dir/raw is present, so 100 x strike is the listed contract. "
+    "A later split rescales an open contract so its dollar value stays "
+    "continuous. Without raw bars the wheel falls back to the split-adjusted "
+    "price and the report says so.",
+    "Dividend-adjusted total-return benchmarks use cache_dir/total "
+    "(Alpaca adjustment=all) when that cache exists. Otherwise they are "
+    "omitted, and the price-return benchmarks do not include dividends.",
 ]
 
 LIMITATIONS = [
@@ -262,6 +274,32 @@ def render_markdown(report):
         "Alerts-only names on the watchlist are not in either book: "
         + ", ".join(coverage.get("alerts_only") or []) + ".")
     lines.append("")
+    if report.get("dividend_benchmarks") == "omitted":
+        lines.append(
+            "Dividend-adjusted total-return benchmarks were omitted. The cache "
+            "has no `total/` bars (Alpaca adjustment=all). SPY and equal-weight "
+            "figures above are split-adjusted price returns, so dividends are "
+            "missing. Re-run with `--fetch` to store that series.")
+        lines.append("")
+    elif report.get("dividend_benchmarks") == "included":
+        lines.append(
+            "Dividend-adjusted total-return benchmarks use the `total/` cache "
+            "(split and dividend). They are labelled separately from the "
+            "price-return SPY figure.")
+        lines.append("")
+    space = report.get("option_price_space")
+    if space == "split_adjusted":
+        lines.append(
+            "Option collateral used split-adjusted prices because `raw/` bars "
+            "were not loaded. A name that split in the sample can show a "
+            "contract that is cheaper than the one that was listed. Fetch raw "
+            "bars before treating a wheel result as real.")
+        lines.append("")
+    elif space == "unadjusted":
+        lines.append(
+            "Option collateral used unadjusted prices. 100 x strike is the "
+            "listed contract on that date. Premiums are still ESTIMATED.")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -322,9 +360,19 @@ def _notional_section(run):
         f"Stock entries skipped because one whole share did not fit: {skipped['stock']}.")
     lines.append("")
     if run.get("experiment_block_date"):
-        lines.append(
-            f"The 10% experiment drawdown block turned on {run['experiment_block_date']} "
-            "and stayed on. New entries after that date were refused. Exits still ran.")
+        if run.get("dd_reset_count"):
+            when = ", ".join(run.get("dd_reset_dates") or [])
+            lines.append(
+                f"RESEARCH drawdown reset: the 10% block turned on "
+                f"{run['experiment_block_date']} and cleared on the first session "
+                f"of a later month ({run['dd_reset_count']} time(s): {when}). "
+                "The shipped risk.RiskState flag never clears. This row is not "
+                "the live runner.")
+        else:
+            lines.append(
+                f"The 10% experiment drawdown block turned on {run['experiment_block_date']} "
+                "and stayed on. New entries after that date were refused. Exits still ran. "
+                "That is the shipped behaviour: the flag is not cleared.")
         lines.append("")
     return lines
 

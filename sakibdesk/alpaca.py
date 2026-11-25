@@ -197,11 +197,18 @@ class MarketData:
         self.http = _Http(DATA_HOST, key_id, secret, session, sleep)
         self.stock_feed, self.option_feed = stock_feed, option_feed
 
-    def daily_bars(self, symbols, start):
+    def daily_bars(self, symbols, start, adjustment="split"):
+        """Daily bars. `adjustment` defaults to split, which is what the live books use.
+
+        The backtest also asks for `raw` (option strikes) and `all` (dividends).
+        Callers that omit `adjustment` still receive split-adjusted bars.
+        """
+        if adjustment not in ("raw", "split", "dividend", "all"):
+            raise ValueError("adjustment must be raw, split, dividend, or all")
         out, tok = {}, None
         while True:
-            p = {"symbols": ",".join(symbols), "timeframe": "1Day", "adjustment": "split", "feed": self.stock_feed,
-                 "start": start, "limit": 10000, "sort": "asc"}
+            p = {"symbols": ",".join(symbols), "timeframe": "1Day", "adjustment": adjustment,
+                 "feed": self.stock_feed, "start": start, "limit": 10000, "sort": "asc"}
             if tok:
                 p["page_token"] = tok
             r = self.http._req("GET", "/v2/stocks/bars", p) or {}
