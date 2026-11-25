@@ -720,12 +720,42 @@ def main(argv=None):
                     help="wheel-expiry: sell the near-expiry put and record the intent.")
     mt.add_argument("--reconcile", action="store_true",
                     help="wheel-expiry: reconcile assignment, the covered call, and delivery or expiry.")
+    bt = sub.add_parser(
+        "backtest",
+        help="Historical backtest of the stock and wheel books. Does not touch the journal.")
+    bt.add_argument("--start", required=True, help="First session date (YYYY-MM-DD).")
+    bt.add_argument("--end", required=True, help="Last session date (YYYY-MM-DD).")
+    bt.add_argument("--capital", default=None,
+                    help="Comma-separated starting capitals. Default: 100,300,500,1000,2000,5000,"
+                         "10000,25000 and the configured paper capital.")
+    bt.add_argument("--books", default="stock,wheel",
+                    help="stock, wheel, or stock,wheel. Default: both.")
+    bt.add_argument("--output-dir", default=None,
+                    help="Directory for the JSON and Markdown reports. Default: reports/backtest. "
+                         "Never the journal.")
+    bt.add_argument("--cache-dir", default=None,
+                    help="CSV cache of split-adjusted daily bars. Default: data/backtest_cache.")
+    bt.add_argument("--fetch", action="store_true",
+                    help="Fill the cache from Alpaca market data (read-only bars). "
+                         "Credentials come from the secrets store.")
+    bt.add_argument("--slippage-bps", type=float, default=10.0,
+                    help="Adverse stock slippage in basis points. Default: 10.")
+    bt.add_argument("--iv-haircut", type=float, default=0.10,
+                    help="Fraction removed from the Black-Scholes premium before the spread. Default: 0.10.")
+    bt.add_argument("--skip-sensitivity", action="store_true",
+                    help="Skip the slippage and IV-haircut grid.")
+    bt.add_argument("--skip-walk-forward", action="store_true",
+                    help="Skip the chronological out-of-sample split.")
     a = ap.parse_args(argv)
+    # Backtest has no --account. It must be dispatched before that lookup.
+    if a.cmd == "backtest":
+        from sakibdesk.backtest.cli import run_cli
+        return run_cli(ROOT, a)
+    if a.cmd == "self-test":
+        return cmd_self_test()
     account = a.account
     if a.cmd == "setup-secrets":
         SS.setup_interactive(ROOT, account); return 0
-    if a.cmd == "self-test":
-        return cmd_self_test()
     cfg = _cfg()
     if a.cmd == "doctor":
         return 0 if doctor(cfg, account=account)[0] else 2
