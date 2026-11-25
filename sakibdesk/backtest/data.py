@@ -169,24 +169,29 @@ def bars_from_alpaca(rows):
 def fetch_cache(root, symbols, start, end, cache_dir):
     """Fetch split-adjusted daily bars into the CSV cache.
 
-    Uses the read-only Alpaca market-data bars endpoint through the existing
-    client. The feed and the split adjustment are the policy feed profile.
-    Credentials are read from the secrets store. A missing key raises
-    CredentialsMissing before any request is made.
+    Uses the read-only Alpaca market-data bars endpoint through MarketData.
+    No trading client is constructed and the account id is not read.
+
+    Credentials are the main profile's key id and secret from secrets_store.get,
+    the same read desk.py uses. On Windows that is Credential Manager first,
+    then the user-only secrets file. A missing key raises CredentialsMissing
+    before any request is made.
 
     Returns ({symbol: number of bars}, [symbols that came back empty]).
     """
     from sakibdesk.alpaca import MarketData
     from sakibdesk.config import Config
-    from sakibdesk.secrets_store import get, redact
+    from sakibdesk.secrets_store import alpaca_keys, get, redact
 
     symbols = [_check_symbol(s) for s in symbols]
     cfg = Config(root)
-    key_id = get("ALPACA_PAPER_KEY_ID", root)
-    secret = get("ALPACA_PAPER_SECRET", root)
+    # Same names as the main profile's market-data client. Not the account id.
+    key_name, secret_name, _expected_name = alpaca_keys("main")
+    key_id = get(key_name, root)
+    secret = get(secret_name, root)
     if not key_id or not secret:
         raise CredentialsMissing(
-            "ALPACA_PAPER_KEY_ID and ALPACA_PAPER_SECRET are required to fetch bars. "
+            f"{key_name} and {secret_name} are required to fetch bars. "
             "They are read from the secrets store only.")
     feed = cfg.feeds["stock_feed"]
     option_feed = cfg.feeds["option_feed"]

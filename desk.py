@@ -747,14 +747,15 @@ def main(argv=None):
     bt.add_argument("--skip-walk-forward", action="store_true",
                     help="Skip the chronological out-of-sample split.")
     a = ap.parse_args(argv)
-    account = a.account
-    if a.cmd == "setup-secrets":
-        SS.setup_interactive(ROOT, account); return 0
-    if a.cmd == "self-test":
-        return cmd_self_test()
+    # Backtest has no --account. It must be dispatched before that lookup.
     if a.cmd == "backtest":
         from sakibdesk.backtest.cli import run_cli
         return run_cli(ROOT, a)
+    if a.cmd == "self-test":
+        return cmd_self_test()
+    account = a.account
+    if a.cmd == "setup-secrets":
+        SS.setup_interactive(ROOT, account); return 0
     cfg = _cfg()
     if a.cmd == "doctor":
         return 0 if doctor(cfg, account=account)[0] else 2

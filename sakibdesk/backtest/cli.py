@@ -235,7 +235,7 @@ def _run(histories, cfg, **kwargs):
 
 
 def _guard_output(output_dir):
-    path = os.path.abspath(output_dir)
+    path = os.path.abspath(os.path.normpath(output_dir))
     if os.path.basename(path) == "journal.sqlite3" or path.endswith(".sqlite3"):
         raise ValueError("refusing to write the backtest onto a journal database")
     return path
@@ -261,7 +261,11 @@ def run_cli(root, args):
         print(f"backtest refused: {exc}")
         return 2
 
-    output_dir = _guard_output(args.output_dir or os.path.join(root, "reports", "backtest"))
+    try:
+        output_dir = _guard_output(args.output_dir or os.path.join(root, "reports", "backtest"))
+    except ValueError as exc:
+        print(f"backtest refused: {exc}")
+        return 2
     cache_dir = os.path.abspath(args.cache_dir or os.path.join(root, "data", "backtest_cache"))
     slippage = float(args.slippage_bps)
     haircut = float(args.iv_haircut)

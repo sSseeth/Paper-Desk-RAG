@@ -1,5 +1,7 @@
 """Offline tests for the historical backtest. No network and no journal writes."""
+import json
 import os
+import shutil
 from datetime import date, timedelta
 
 import pytest
@@ -9,9 +11,8 @@ from sakibdesk.backtest.cli import decorate, default_capitals, parse_books, pars
 from sakibdesk.backtest.data import Bar, CredentialsMissing, History, cache_path, load_csv, write_csv
 from sakibdesk.backtest.engine import RiskBook, run_backtest, split_sessions
 from sakibdesk.backtest.metrics import equal_weight, summarise
-from sakibdesk.backtest.report import capital_skips, render_markdown
 from sakibdesk.backtest.pricing import bs_price, early_exercise, quoted
-from sakibdesk.backtest.report import JSON_NAME, MD_NAME
+from sakibdesk.backtest.report import JSON_NAME, MD_NAME, capital_skips, render_markdown
 from sakibdesk.config import Config
 from sakibdesk.risk import RiskState
 
@@ -431,6 +432,172 @@ def test_cli_writes_reports_and_refuses_an_empty_cache(tmp_path, capsys):
     # The grid is present, and the paper-capital row is not required when the
     # caller asked for a single capital.
     assert "10,000" in text or "10000" in text
+
+
+_EXACT_ARGV = [
+    "backtest",
+    "--start", "2021-01-04",
+    "--end", "2026-01-02",
+    "--output-dir", "reports\\backtest",
+    "--fetch",
+]
+
+
+def _fake_alpaca_bars(symbol):
+    """A short weekday series inside the exact command's window."""
+    if symbol not in ("SPY", "MU"):
+        return []
+    rows, cursor, n, px = [], date(2021, 1, 4), 0, 100.0
+    while n < 15:
+        if cursor.weekday() < 5:
+            rows.append({
+                "t": cursor.isoformat() + "T05:00:00Z",
+                "o": px, "h": px + 1.0, "l": px - 0.5, "c": px + 0.4, "v": 1000,
+            })
+            n += 1
+            px += 0.4
+        cursor += timedelta(days=1)
+    return rows
+
+
+class _RecordingMarketData:
+    """Stand-in for MarketData. Records the key and serves bars. No trading methods."""
+
+    instances = []
+
+    def __init__(self, key_id, secret, stock_feed, option_feed):
+        self.key_id = key_id
+        self.secret = secret
+        self.stock_feed = stock_feed
+        self.option_feed = option_feed
+        self.calls = []
+        _RecordingMarketData.instances.append(self)
+
+    def daily_bars(self, symbols, start):
+        self.calls.append((list(symbols), start))
+        symbol = symbols[0]
+        return {symbol: _fake_alpaca_bars(symbol)}
+
+
+def _refuse_trading_client(*_args, **_kwargs):
+    raise AssertionError("backtest fetch must not construct a trading client")
+
+
+def test_main_exact_windows_fetch_argv(monkeypatch, tmp_path, capsys):
+    """The command a Windows user runs. main() must not read --account."""
+    import desk
+    from sakibdesk.secrets_store import alpaca_keys
+
+    monkeypatch.chdir(tmp_path)
+    _RecordingMarketData.instances = []
+    seen = []
+
+    def fake_get(name, root):
+        seen.append((name, os.path.abspath(root)))
+        if name == "ALPACA_PAPER_KEY_ID":
+            return "test-key-id"
+        if name == "ALPACA_PAPER_SECRET":
+            return "test-secret"
+        return None
+
+    monkeypatch.setattr("sakibdesk.secrets_store.get", fake_get)
+    monkeypatch.setattr("sakibdesk.alpaca.MarketData", _RecordingMarketData)
+    monkeypatch.setattr("sakibdesk.alpaca.PaperReader", _refuse_trading_client)
+    monkeypatch.setattr("sakibdesk.alpaca.PaperWriter", _refuse_trading_client)
+    journal = os.path.join(ROOT, "data", "journal.sqlite3")
+    journal_before = os.path.exists(journal)
+    cache = os.path.join(ROOT, "data", "backtest_cache")
+    try:
+        code = desk.main(list(_EXACT_ARGV))
+    finally:
+        if os.path.isdir(cache):
+            shutil.rmtree(cache)
+    captured = capsys.readouterr().out
+    assert code == 0, captured
+    out = tmp_path / "reports\\backtest"
+    report_json = out / JSON_NAME
+    report_md = out / MD_NAME
+    assert report_json.is_file() and report_md.is_file()
+    body = json.loads(report_json.read_text(encoding="utf-8"))
+    text = report_md.read_text(encoding="utf-8")
+    assert body["config_hash"] == HASH
+    assert body["label"] == "ESTIMATED"
+    assert "ESTIMATED" in text
+    assert "100.00" in text and "100,000.00" in text
+    key_name, secret_name, expected_name = alpaca_keys("main")
+    assert (key_name, os.path.abspath(ROOT)) in seen
+    assert (secret_name, os.path.abspath(ROOT)) in seen
+    assert expected_name not in {name for name, _root in seen}
+    assert _RecordingMarketData.instances
+    client = _RecordingMarketData.instances[0]
+    assert client.key_id == "test-key-id" and client.secret == "test-secret"
+    assert client.stock_feed == "iex"
+    assert client.calls and all(len(symbols) == 1 for symbols, _start in client.calls)
+    assert os.path.exists(journal) == journal_before
+    assert not list(tmp_path.rglob("*.sqlite*"))
+
+
+def test_main_exact_argv_without_secrets_does_not_crash(monkeypatch, tmp_path, capsys):
+    import desk
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sakibdesk.secrets_store.get", lambda name, root: None)
+    monkeypatch.setattr("sakibdesk.alpaca.PaperReader", _refuse_trading_client)
+    monkeypatch.setattr("sakibdesk.alpaca.PaperWriter", _refuse_trading_client)
+
+    def no_data(*_args, **_kwargs):
+        raise AssertionError("market data must not be called without credentials")
+
+    monkeypatch.setattr("sakibdesk.alpaca.MarketData", no_data)
+    code = desk.main(list(_EXACT_ARGV))
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "secrets store" in out
+    assert not (tmp_path / "reports\\backtest").exists()
+
+
+def test_main_backtest_other_paths(monkeypatch, tmp_path, capsys):
+    """Report writing, a Windows output path, and the refusals main() can hit."""
+    import desk
+    monkeypatch.chdir(tmp_path)
+    cache = tmp_path / "cache"
+    dates = _dates(20, "2021-01-04")
+    write_csv(cache_path(str(cache), "SPY"), _trend(dates))
+    write_csv(cache_path(str(cache), "MU"), _trend(dates))
+    code = desk.main([
+        "backtest", "--start", dates[0], "--end", dates[-1],
+        "--output-dir", "reports\\backtest", "--cache-dir", str(cache),
+        "--capital", "100", "--books", "stock",
+        "--skip-sensitivity", "--skip-walk-forward",
+    ])
+    assert code == 0, capsys.readouterr().out
+    written = tmp_path / "reports\\backtest" / MD_NAME
+    assert written.is_file()
+    assert "ESTIMATED" in written.read_text(encoding="utf-8")
+    assert desk.main([
+        "backtest", "--start", "2021-06-01", "--end", "2021-01-04",
+        "--output-dir", str(tmp_path / "out"),
+    ]) == 2
+    assert desk.main([
+        "backtest", "--start", "not-a-date", "--end", "2021-06-01",
+        "--output-dir", str(tmp_path / "out"),
+    ]) == 2
+    assert desk.main([
+        "backtest", "--start", "2021-01-04", "--end", "2021-06-01",
+        "--books", "crypto", "--output-dir", str(tmp_path / "out"),
+    ]) == 2
+    assert desk.main([
+        "backtest", "--start", dates[0], "--end", dates[-1],
+        "--output-dir", str(tmp_path / "journal.sqlite3"),
+        "--cache-dir", str(cache), "--capital", "100", "--books", "stock",
+        "--skip-sensitivity", "--skip-walk-forward",
+    ]) == 2
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert desk.main([
+        "backtest", "--start", "2021-01-04", "--end", "2021-06-01",
+        "--output-dir", str(tmp_path / "nowhere"), "--cache-dir", str(empty),
+        "--skip-sensitivity", "--skip-walk-forward",
+    ]) == 2
 
 
 class _Args:
