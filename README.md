@@ -173,6 +173,7 @@ Run them as `py desk.py <command>` from the repository root. On Windows, every P
 | `lifecycle-record --check stock\|wheel-sell-buyback\|wheel --evidence "..."` | Mechanics only. After read-only checks pass, record that check in `state/lifecycle_gate.json`. `wheel` requires `OBSERVED_PAPER_ASSIGNMENT` and rejects `MOCK`. Refuses `--account main`. |
 | `mechanics-test --suite stock\|wheel-sell-buyback\|wheel-expiry` | Mechanics only. Broker-verified lifecycle steps on `F`, journaled separately from the main book. See [Mechanics lifecycle tests](#mechanics-lifecycle-tests). |
 | `cycle --mode DRY_RUN\|AUTO_PAPER` | Run one cycle under a process lock. `--mode` is required. Main `AUTO_PAPER` requires `stock_lifecycle`. Wheel entries also require `wheel_sell_buyback` and the mock wheel paths, and stay `PROVISIONAL` until `wheel_lifecycle`. |
+| `backtest --start YYYY-MM-DD --end YYYY-MM-DD` | Historical backtest of the stock book and the wheel book. Writes `backtest_report.json` and `backtest_report.md`. Does not trade and does not write the journal or the paper performance series. See [Historical backtest](#historical-backtest). |
 
 If `data/desk.lock` is already held, `cycle` prints a message and exits 0 without sending orders. `flatten` takes the same lock after the credential check and does not catch a busy lock, so a second flatten fails instead of sending another batch.
 
@@ -237,6 +238,7 @@ run-paper.sh             cron entry, one AUTO_PAPER cycle
 requirements.txt         Pinned Python packages
 pytest.ini               Pytest paths; cache provider disabled
 sakibdesk/               Runner package (broker client, books, journal, research, risk)
+sakibdesk/backtest/      Historical backtest (CSV cache, estimated wheel prices, its own report)
 schemas/                 Pinned news schema v1.7, plus v1.2, v1.3, v1.5 and v1.6 for history
 tests/                   Offline pytest suite and fixtures
 .github/workflows/tests.yml
@@ -255,7 +257,27 @@ Create the virtual environment and install `requirements.txt` the same way as [S
 py -m pytest
 ```
 
-`python desk.py self-test` runs that same suite. GitHub Actions (`.github/workflows/tests.yml`) runs it on `ubuntu-latest` with Python 3.11 for pushes and pull requests to `main`. The workflow has `contents: read` only, passes no secrets, and sets `PYTHON_KEYRING_BACKEND` to the null keyring so a headless runner does not probe the Secret Service.
+`python desk.py self-test` runs that same suite. GitHub Actions (`.github/workflows/tests.yml`) runs it on `ubuntu-latest` with Python 3.11 and 3.13 for pushes and pull requests to `main`. The workflow has `contents: read` only, passes no secrets, and sets `PYTHON_KEYRING_BACKEND` to the null keyring so a headless runner does not probe the Secret Service.
+
+## Historical backtest
+
+`py desk.py backtest` replays the shipped stock and wheel rules on daily split-adjusted bars. It calls the live signal, size, exit, contract screen, tick rounding, and wheel state machine. It does not change `policy.json`, `watchlist.json`, or the config hash. It does not write the journal, the paper performance series, or any broker order.
+
+Wheel prices are estimates. The report labels them ESTIMATED. A cache of CSV bars is enough to run; tests use synthetic bars and do not open a network connection. `--fetch` optionally fills the cache from the Alpaca market-data bars endpoint (`data.alpaca.markets`, split-adjusted, the policy feed). It also requests the 420 calendar days before `--start`, which is the same warmup the live runner uses, so the 200-day average exists on the first session. The key and secret come from the existing secrets store. They are not command-line arguments and they are not written into the cache.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py backtest --start 2021-01-04 --end 2026-01-02 --output-dir reports\backtest --fetch
+```
+
+`--capital` accepts a comma-separated list. The default list is 2000, 5000, 10000, 25000, and the configured paper capital. `--books` is `stock`, `wheel`, or `stock,wheel`.
+
+The report is a point-in-time calculation with these limits:
+
+- Survivorship bias. The universe is the watchlist fixed in this repository today. Names that failed earlier are absent.
+- Estimated option prices. The wheel book uses Black-Scholes on realised volatility, with an IV haircut, a bid/ask haircut, and the live tick rounding. That is not a historical option chain.
+- Idealised fills. Decisions use the session open. A daily bar that touches both the stop and the target is filled at the stop. Historical research cards, earnings dates, dividends, and open interest are not in the cache; the report states the assumption used for each.
+- It is not a forecast and it is not financial advice.
 
 ## Status and limitations
 
