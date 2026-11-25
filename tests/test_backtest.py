@@ -473,8 +473,8 @@ class _RecordingMarketData:
         self.calls = []
         _RecordingMarketData.instances.append(self)
 
-    def daily_bars(self, symbols, start):
-        self.calls.append((list(symbols), start))
+    def daily_bars(self, symbols, start, adjustment="split"):
+        self.calls.append((list(symbols), start, adjustment))
         symbol = symbols[0]
         return {symbol: _fake_alpaca_bars(symbol)}
 
@@ -532,7 +532,8 @@ def test_main_exact_windows_fetch_argv(monkeypatch, tmp_path, capsys):
     client = _RecordingMarketData.instances[0]
     assert client.key_id == "test-key-id" and client.secret == "test-secret"
     assert client.stock_feed == "iex"
-    assert client.calls and all(len(symbols) == 1 for symbols, _start in client.calls)
+    assert client.calls and all(len(symbols) == 1 for symbols, _start, _adj in client.calls)
+    assert {"split", "raw", "all"} <= {adj for _symbols, _start, adj in client.calls}
     assert os.path.exists(journal) == journal_before
     assert not list(tmp_path.rglob("*.sqlite*"))
 
@@ -617,3 +618,89 @@ class _Args:
 
 def _args(**kwargs):
     return _Args(**kwargs)
+
+
+def test_unadjusted_wheel_collateral_removes_the_cheap_contract():
+    """A 40x split makes the adjusted strike look fundable at $5,000.
+
+    The raw contract is 100 shares at the unadjusted strike and is skipped.
+    """
+    dates = _dates(140)
+    adjusted = _choppy(dates, lo=4.0, hi=4.2)
+    raw = [Bar(b.date, b.o * 40, b.h * 40, b.l * 40, b.c * 40, b.v) for b in adjusted]
+    window = dict(start=dates[70], end=dates[-1], capital=5000.0, books=("wheel",),
+                  slippage_bps=0.0, iv_haircut=0.0)
+    cheap = run_backtest({"MU": History(adjusted)}, _cfg(), **window)
+    real = run_backtest({"MU": History(adjusted, raw_bars=raw)}, _cfg(), **window)
+    assert cheap["option_price_space"] == "split_adjusted"
+    assert real["option_price_space"] == "unadjusted"
+    assert any(t["book"] == "WHEEL" for t in cheap["trades"]), cheap["skips"]
+    opened = next(t for t in cheap["trades"] if t["book"] == "WHEEL")
+    assert opened["notional"] < 1000
+    assert not any(t["book"] == "WHEEL" for t in real["trades"])
+    assert real["notionals"]["MU"]["min"] > 5000
+    refused = real["skips"]["MU"]
+    assert refused.get("notional_cap", 0) + refused.get("insufficient_cash", 0) > 0
+
+
+def test_split_rescales_an_open_wheel_position():
+    dates = _dates(6)
+    adjusted = _choppy(dates, lo=50, hi=51)
+    raw = []
+    for i, bar in enumerate(adjusted):
+        scale = 2.0 if i < 3 else 1.0
+        raw.append(Bar(bar.date, bar.o * scale, bar.h * scale, bar.l * scale, bar.c * scale, bar.v))
+    hist = History(adjusted, raw_bars=raw)
+    assert hist.split_factor(dates[0]) == pytest.approx(2.0)
+    assert hist.split_factor(dates[4]) == pytest.approx(1.0)
+    from sakibdesk.backtest.engine import Simulator, build_calendar
+    calendar = build_calendar(dates)
+    sim = Simulator(
+        {"MU": hist}, calendar, dates, _cfg(), capital=100000.0, books=("wheel",),
+        slippage_bps=0.0, iv_haircut=0.0)
+    cycle = {
+        "symbol": "MU", "state": "SHARES_HELD", "raw_priced": True, "split_factor": 2.0,
+        "multiplier": 100.0, "strike": 100.0, "shares": 100.0, "acquisition_price": 100.0,
+        "open_premium": 2.0, "last_ask": 1.0, "kind": None,
+    }
+    sim.cycles.append(cycle)
+    sim._rescale_open_wheels(dates[4])
+    assert cycle["shares"] == pytest.approx(200.0)
+    assert cycle["multiplier"] == pytest.approx(200.0)
+    assert cycle["acquisition_price"] == pytest.approx(50.0)
+    assert cycle["strike"] == pytest.approx(50.0)
+
+
+def test_monthly_drawdown_reset_is_research_only():
+    policy = _cfg().policy
+    shipped = RiskBook(policy, 100.0)
+    shipped.blocks(80.0, "2022-04-27")
+    assert "EXPERIMENT_DRAWDOWN_10PCT" in shipped.blocks(80.0, "2022-05-02")
+    assert shipped.reset_count == 0
+    research = RiskBook(policy, 100.0, reset_mode="monthly")
+    research.blocks(80.0, "2022-04-27")
+    assert "EXPERIMENT_DRAWDOWN_10PCT" in research.blocks(85.0, "2022-04-28")
+    cleared = research.blocks(80.0, "2022-05-02")
+    assert "EXPERIMENT_DRAWDOWN_10PCT" not in cleared
+    assert research.reset_count == 1
+    assert research.reset_dates == ["2022-05-02"]
+    assert research.first_trip == "2022-04-27"
+
+
+def test_fractional_shares_are_opt_in():
+    dates, histories = _stock_case()
+    day = dates[-1]
+    cfg = _cfg()
+    whole = run_backtest(
+        histories, cfg, start=day, end=day, capital=100.0, books=("stock",), slippage_bps=0.0)
+    frac = run_backtest(
+        histories, cfg, start=day, end=day, capital=100.0, books=("stock",), slippage_bps=0.0,
+        fractional=True)
+    assert not any(t["book"] == "STOCK" for t in whole["trades"])
+    assert whole["share_rounding"] == "whole_share"
+    held = [t for t in frac["trades"] if t["book"] == "STOCK"]
+    assert held, frac["skips"]
+    assert 0 < held[0]["qty"] < 1
+    assert held[0]["fractional"] is True
+    assert frac["share_rounding"] == "fractional_RESEARCH"
+    assert frac["config_hash"] == HASH

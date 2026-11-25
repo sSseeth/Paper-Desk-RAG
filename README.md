@@ -270,6 +270,15 @@ Wheel prices are estimates. The report labels them ESTIMATED. A cache of CSV bar
 py desk.py backtest --start 2021-01-04 --end 2026-01-02 --output-dir reports\backtest --fetch
 ```
 
+`--fetch` stores three series. Split-adjusted bars stay in the cache root and feed signals. Unadjusted bars go in `raw/` and are what option strikes and collateral use, so 100 times the strike is the contract listed that day. Dividend-adjusted bars (`adjustment=all`) go in `total/` and are used only for total-return benchmarks. Without `total/`, those benchmarks are omitted and the report says so.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+py desk.py backtest --start 2021-01-04 --end 2026-01-02 --output-dir reports\research --strategies all --fractional --dd-reset --fetch
+```
+
+`--strategies` is RESEARCH only. `all` runs a pre-declared grid (the shipped desk, a monthly drawdown-reset variant, momentum, index trend, dual momentum, wheel variants, stock-signal timeframes, and buy-and-hold benchmarks) plus a sector-ETF momentum check. It writes `research_comparison.json` and `research_comparison.md`. The ranked table is the out-of-sample result after an in-sample Sharpe choice. It does not change `policy.json`, `watchlist.json`, the config hash, or the live runner. `--fractional` allows fractional equity shares. The default remains whole shares. `--dd-reset` is the research rule that clears the 10% block on the first session of the next month. On `--strategies all` that variant is already in the grid.
+
 `--capital` accepts a comma-separated list. The default list is 100, 300, 500, 1000, 2000, 5000, 10000, 25000, and the configured paper capital. Sizing stays in whole shares, the same floor `stock.size` uses, and a wheel entry is one contract. A name that cannot fund one share, or one contract, plus the policy overlay is skipped and counted at that capital. Slippage stays in basis points, so the dollar slippage scales with the fill. `--books` is `stock`, `wheel`, or `stock,wheel`.
 
 The report is a point-in-time calculation with these limits:

@@ -51,9 +51,14 @@ class RiskBook:
 
     The paper journal is not opened. `equity_high` starts at the scenario
     capital, which is the experiment's starting equity.
+
+    The shipped block, like risk.RiskState, sets the flag and never clears
+    it. `reset_mode="monthly"` is a RESEARCH variant: on the first session of
+    a later calendar month the flag clears and the high-water mark restarts
+    at that session's equity. The live runner does not do this.
     """
 
-    def __init__(self, policy, start_equity):
+    def __init__(self, policy, start_equity, reset_mode=None):
         self.daily_pct = policy["risk"]["daily_loss_pct"]
         self.dd_pct = policy["risk"]["experiment_drawdown_pct"]
         self.high = float(start_equity)
@@ -61,9 +66,25 @@ class RiskBook:
         self.experiment = False
         self.daily_session = None
         self.tripped_on = None
+        self.first_trip = None
         self.daily_blocks = 0
+        self.reset_mode = reset_mode
+        self.reset_count = 0
+        self.reset_dates = []
+
+    def _maybe_reset(self, equity, session):
+        if self.reset_mode != "monthly" or not self.experiment or not self.tripped_on:
+            return
+        if session[:7] <= self.tripped_on[:7]:
+            return
+        self.experiment = False
+        self.high = float(equity)
+        self.tripped_on = None
+        self.reset_count += 1
+        self.reset_dates.append(session)
 
     def blocks(self, equity, session):
+        self._maybe_reset(equity, session)
         self.high = max(self.high, equity)
         blocked = []
         if self.prior and equity <= self.prior * (1.0 - self.daily_pct):
@@ -74,6 +95,8 @@ class RiskBook:
             self.experiment = True
             if self.tripped_on is None:
                 self.tripped_on = session
+            if self.first_trip is None:
+                self.first_trip = session
         if self.experiment:
             blocked.append("EXPERIMENT_DRAWDOWN_10PCT")
         return blocked
@@ -168,7 +191,10 @@ class Simulator:
     """One capital, one cost assumption, one date window."""
 
     def __init__(self, histories, calendar, sessions, cfg, *, capital, books,
-                 slippage_bps, iv_haircut, earnings_provider=None):
+                 slippage_bps, iv_haircut, earnings_provider=None, fractional=False,
+                 dd_reset=None, stock_params=None, wheel_params=None, wheel_symbols=None,
+                 put_trend_sma=None, entry_frequency="daily", research_id=None,
+                 deploy="policy"):
         self.hist = histories
         self.calendar = calendar
         self.sessions = list(sessions)
@@ -180,8 +206,10 @@ class Simulator:
         # `sessions` for the window only; keep the full set separately.
         self.cfg = cfg
         self.policy = cfg.policy
-        self.stock_p = cfg.policy["stock"]
-        self.wheel_p = cfg.policy["wheel"]
+        # Copies are research parameter sets. policy.json is never written.
+        self.stock_p = stock_params if stock_params is not None else cfg.policy["stock"]
+        self.wheel_p = wheel_params if wheel_params is not None else cfg.policy["wheel"]
+        self.wheel_names = list(wheel_symbols) if wheel_symbols is not None else list(cfg.wheel_symbols)
         self.capital = float(capital)
         self.stock_capital, self.wheel_capital = sleeve_capitals(cfg.policy, self.capital)
         self.books = frozenset(books)
@@ -189,6 +217,26 @@ class Simulator:
         self.slippage_bps = float(slippage_bps)
         self.iv_haircut = float(iv_haircut)
         self.earnings_provider = earnings_provider
+        self.fractional = bool(fractional)
+        self.dd_reset = dd_reset
+        self.put_trend_sma = put_trend_sma
+        self.entry_frequency = entry_frequency
+        self.research_id = research_id
+        self.deploy = deploy
+        self._last_session = None
+        self.traded_dollars = 0.0
+        if deploy == "stock":
+            self.stock_capital = self.capital
+            self.wheel_capital = 0.0
+            self.stock_cash = self.capital
+            self.wheel_cash = 0.0
+        elif deploy == "wheel":
+            self.stock_capital = 0.0
+            self.wheel_capital = self.capital
+            self.stock_cash = 0.0
+            self.wheel_cash = self.capital
+        elif deploy != "policy":
+            raise ValueError("deploy must be policy, stock, or wheel")
         self.stock_comm = float(cfg.policy["costs"]["overlay_per_stock_transaction"])
         self.option_comm = float(cfg.policy["costs"]["overlay_per_option_contract_per_side"])
         # Both sleeves exist even when one book is idle, matching the policy
@@ -199,15 +247,15 @@ class Simulator:
         self.cycles = []
         self.trades = []
         self.curve = []
-        self.risk = RiskBook(cfg.policy, self.capital)
+        self.risk = RiskBook(cfg.policy, self.capital, reset_mode=dd_reset)
         self.last_equity = self.capital
         self.wheel_blocked = set()
         self.bought_today = set()
         self.exited_today = set()
         self.screen_cache = {}
         self.skip_counts = {}
-        self.notional_obs = {s: [] for s in cfg.wheel_symbols}
-        self.monthly_min = {s: {} for s in cfg.wheel_symbols}
+        self.notional_obs = {s: [] for s in self.wheel_names}
+        self.monthly_min = {s: {} for s in self.wheel_names}
         self.option_sides = 0
         self.stock_txns = 0
         self.put_assignments = 0
@@ -223,6 +271,7 @@ class Simulator:
             raise ValueError("no trading sessions in the requested window")
         for today in self.sessions:
             self.today = today
+            self._rescale_open_wheels(today)
             self.bought_today = set()
             self.exited_today = set()
             self.screen_cache = {}
@@ -255,7 +304,7 @@ class Simulator:
             if "wheel" in self.books:
                 self._survey(today, wheel_now)
 
-            if not blocks and stock_window and "stock" in self.books:
+            if not blocks and stock_window and "stock" in self.books and self._entries_today(today):
                 self._stock_entries(today, stock_now, base)
                 for pos in list(self.stock_positions):
                     if pos["entry_date"] == today:
@@ -272,12 +321,16 @@ class Simulator:
             total, stock_eq, wheel_eq = self._mark("close")
             self.risk.set_prior(total)
             self.last_equity = total
+            invested = self._exposed()
+            exposure = (invested / total) if total else 0.0
             self.curve.append({
                 "date": today,
                 "equity": total,
                 "stock_equity": stock_eq,
                 "wheel_equity": wheel_eq,
+                "exposure": exposure,
             })
+            self._last_session = today
         return self._result()
 
     # ----------------------------------------------------------------- data
@@ -297,6 +350,107 @@ class Simulator:
         if bar is None:
             return None
         return bar.o if field == "o" else bar.c
+
+    def _uses_raw(self, symbol):
+        hist = self.hist.get(symbol)
+        return bool(hist is not None and hist.has_raw)
+
+    def _wheel_open(self, symbol, today):
+        """Unadjusted open when raw bars exist, else the split-adjusted open.
+
+        Returns (price, factor). The factor scales an adjusted indicator into
+        that day's dollars. A missing raw bar on a symbol that has a raw
+        series returns (None, factor) so the entry is skipped rather than
+        mixed with the adjusted price.
+        """
+        adj = self._spot(symbol, today, "o")
+        if not self._uses_raw(symbol):
+            return adj, 1.0
+        hist = self.hist[symbol]
+        raw = hist.raw_on(today)
+        if raw is None or adj is None or adj <= 0:
+            return None, hist.split_factor(today, "o")
+        return raw.o, raw.o / adj
+
+    def _wheel_close(self, symbol, today):
+        if not self._uses_raw(symbol):
+            return self._spot(symbol, today, "c")
+        raw = self.hist[symbol].raw_on(today)
+        if raw is None:
+            return None
+        return raw.c
+
+    def _cycle_spot(self, cyc, field):
+        if cyc.get("raw_priced"):
+            if field == "o":
+                px, _factor = self._wheel_open(cyc["symbol"], self.today)
+                return px
+            return self._wheel_close(cyc["symbol"], self.today)
+        return self._spot(cyc["symbol"], self.today, field)
+
+    def _entries_today(self, today):
+        """RESEARCH weekly gate. The shipped frequency is every session."""
+        if self.entry_frequency != "weekly":
+            return True
+        if self._last_session is None:
+            return True
+        prev = date.fromisoformat(self._last_session).isocalendar()[:2]
+        return date.fromisoformat(today).isocalendar()[:2] != prev
+
+    def _deliverable(self, cyc):
+        return float(cyc.get("multiplier") or 100.0)
+
+    def _reserved(self, cyc):
+        allowance = self.wheel_p["put_reserve_cost_allowance_per_contract"]
+        mult = self._deliverable(cyc)
+        if abs(mult - 100.0) < 1e-6:
+            return wheel.put_collateral(cyc["strike"], self.wheel_p)
+        return cyc["strike"] * mult + allowance
+
+    def _note_trade(self, dollars):
+        self.traded_dollars += abs(float(dollars))
+
+    def _exposed(self):
+        """Long stock value plus cash-secured put collateral, in dollars."""
+        total = 0.0
+        for pos in self.stock_positions:
+            total += pos["qty"] * (pos.get("last_px") or pos["entry"])
+        for cyc in self._active():
+            if cyc["state"] in ("PUT_OPEN", "PUT_PENDING", "PUT_CLOSING"):
+                total += cyc["strike"] * self._deliverable(cyc)
+            elif cyc["shares"]:
+                total += cyc["shares"] * (cyc.get("last_px") or cyc.get("acquisition_price") or 0.0)
+        return total
+
+    def _rescale_open_wheels(self, today):
+        """Keep an open contract's dollar value continuous across a split.
+
+        A 10-for-1 split divides the raw price by 10. The listed deliverable
+        becomes 1,000 shares at one tenth of the strike. Cash already booked
+        is left alone.
+        """
+        for cyc in self._active():
+            if not cyc.get("raw_priced"):
+                continue
+            factor = self.hist[cyc["symbol"]].split_factor(today, "c")
+            prev = cyc.get("split_factor")
+            cyc["split_factor"] = factor
+            if not prev or prev <= 0 or factor <= 0:
+                continue
+            ratio = prev / factor
+            if 0.8 < ratio < 1.25:
+                continue
+            cyc["multiplier"] = self._deliverable(cyc) * ratio
+            if cyc.get("strike"):
+                cyc["strike"] /= ratio
+            if cyc.get("acquisition_price"):
+                cyc["acquisition_price"] /= ratio
+            if cyc.get("open_premium"):
+                cyc["open_premium"] /= ratio
+            if cyc.get("last_ask"):
+                cyc["last_ask"] /= ratio
+            if cyc.get("shares"):
+                cyc["shares"] = cyc["shares"] * ratio
 
     def _research(self, symbol, today):
         if self.earnings_provider is not None:
@@ -370,16 +524,19 @@ class Simulator:
             stock_rows.append({"qty": pos["qty"], "bid": px * (1.0 - STOCK_HALF_SPREAD)})
         for cyc in self._active():
             if cyc["shares"]:
-                px = self._spot(cyc["symbol"], self.today, field) or cyc.get("last_px")
+                px = self._cycle_spot(cyc, field) or cyc.get("last_px")
                 if px is not None:
                     cyc["last_px"] = px
                     wheel_rows.append({"qty": cyc["shares"], "bid": px * (1.0 - STOCK_HALF_SPREAD)})
             if cyc["state"] in ("PUT_OPEN", "CALL_OPEN"):
-                px = self._spot(cyc["symbol"], self.today, field) or cyc.get("last_px")
+                px = self._cycle_spot(cyc, field) or cyc.get("last_px")
                 ask = self._option_ask(cyc, px, self.today, inclusive)
                 if ask is None:
                     ask = max(cyc.get("last_ask") or 0.0, cyc.get("open_premium") or 0.0)
-                options.append({"qty": 1, "ask": ask})
+                # accounting.conservative_equity multiplies by 100. Scale the
+                # ask so a split-adjusted deliverable is still 100 * ask_shown.
+                scale = self._deliverable(cyc) / 100.0
+                options.append({"qty": 1, "ask": ask * scale})
         total = accounting.conservative_equity(
             self.stock_cash + self.wheel_cash, stock_rows + wheel_rows, options)
         stock_eq = accounting.conservative_equity(self.stock_cash, stock_rows, [])
@@ -396,8 +553,29 @@ class Simulator:
         return total, stock_eq, wheel_eq
 
     # ---------------------------------------------------------------- stock
+    def _share_qty(self, base, fill, r_value):
+        p = self.stock_p
+        caps = min(
+            p["max_pct_per_company"] * base / fill,
+            p["risk_pct_per_entry"] * base / r_value,
+            self.stock_cash / fill)
+        if caps <= 0:
+            return 0
+        if not self.fractional:
+            qty = int(stock.size(base, fill, r_value, self.stock_cash, p))
+            while qty > 0 and qty * fill + self.stock_comm > self.stock_cash + 1e-9:
+                qty -= 1
+            return qty
+        qty = math.floor(caps * 1_000_000) / 1_000_000
+        while qty > 0 and qty * fill + self.stock_comm > self.stock_cash + 1e-9:
+            qty = math.floor((qty - 0.000001) * 1_000_000) / 1_000_000
+        if qty * fill < 1.0:
+            return 0
+        return qty
+
     def _close_stock(self, pos, today, fill, reason):
         fill = stock.round_px(fill)
+        self._note_trade(fill * pos["qty"])
         self._cash("STOCK", round(fill * pos["qty"], 2), "stock_sell")
         self._charge_stock("STOCK")
         pnl = round((fill - pos["entry"]) * pos["qty"] - pos["entry_commission"] - self.stock_comm, 2)
@@ -504,15 +682,16 @@ class Simulator:
         if fill <= 0 or cand["R"] is None or cand["R"] <= 0:
             self._count(symbol, "insufficient_capital")
             return
-        # stock.size floors. The fee loop steps by one share. Never a fraction.
-        qty = int(stock.size(base, fill, cand["R"], self.stock_cash, self.stock_p))
-        while qty > 0 and qty * fill + self.stock_comm > self.stock_cash + 1e-9:
-            qty -= 1
+        # The three caps are stock.size. The shipped path floors to a whole
+        # share. --fractional is RESEARCH and keeps six decimal places, which
+        # is what Alpaca accepts for equities. The policy overlay is not scaled.
+        qty = self._share_qty(base, fill, cand["R"])
         if qty <= 0:
             self._count(symbol, "insufficient_capital")
             return
         _body, stop, target = stock.bracket_body(symbol, qty, fill, cand["R"], self.stock_p)
         self._stock_n += 1
+        self._note_trade(qty * fill)
         self._cash("STOCK", -round(qty * fill, 2), "stock_buy")
         self._charge_stock("STOCK")
         self.stock_positions.append({
@@ -542,6 +721,7 @@ class Simulator:
             "pnl": None,
             "estimated": False,
             "option_prices": None,
+            "fractional": self.fractional,
         })
 
     # ---------------------------------------------------------------- wheel
@@ -609,10 +789,17 @@ class Simulator:
         key = (today, symbol, kind, None if acq is None else round(acq, 4))
         if key in self.screen_cache:
             return self.screen_cache[key]
-        px = self._spot(symbol, today, "o")
+        # Strikes are in that day's dollars. When raw bars are loaded, the
+        # adjusted SMA is scaled by the split factor so 100 x strike is the
+        # listed contract, not the split-adjusted lookalike.
+        px_adj = self._spot(symbol, today, "o")
+        px, factor = self._wheel_open(symbol, today)
         bars = self._window(symbol, today)
-        sma50 = sma([b["c"] for b in bars], self.stock_p["sma_fast"]) if bars else None
-        if px is None:
+        sma50_adj = sma([b["c"] for b in bars], self.stock_p["sma_fast"]) if bars else None
+        sma50 = None if sma50_adj is None else sma50_adj * factor
+        if self._uses_raw(symbol) and px_adj is not None and px is None:
+            result = (None, "raw_bar_missing")
+        elif px is None:
             result = (None, "no_bar")
         elif kind == "put" and sma50 is None:
             result = (None, "no_sma")
@@ -639,12 +826,14 @@ class Simulator:
                         result = (None, "no_contract")
                     else:
                         best["sigma"] = vol
+                        best["split_factor"] = factor
+                        best["raw_priced"] = self._uses_raw(symbol)
                         result = (best, None)
         self.screen_cache[key] = result
         return result
 
     def _survey(self, today, now):
-        for symbol in self.cfg.wheel_symbols:
+        for symbol in self.wheel_names:
             if symbol not in self.hist:
                 continue
             best, _why = self._evaluate("put", symbol, today, now)
@@ -657,21 +846,30 @@ class Simulator:
             if prev is None or notional < prev:
                 self.monthly_min[symbol][month] = notional
 
+    def _above_sma(self, symbol, today, window):
+        """True when the last completed adjusted close is above its SMA.
+
+        Used only by the RESEARCH put trend filter. A short history is not
+        above the average, so the put is skipped.
+        """
+        closes = [b["c"] for b in self._window(symbol, today)]
+        avg = sma(closes, window)
+        return bool(closes) and avg is not None and closes[-1] > avg
+
     def _combined_used(self):
-        allowance = self.wheel_p["put_reserve_cost_allowance_per_contract"]
         used = 0.0
         for cyc in self._active():
             if cyc["state"] in ("PUT_PENDING", "PUT_OPEN", "PUT_CLOSING"):
-                used += cyc["strike"] * 100.0 + allowance
+                used += self._reserved(cyc)
             elif cyc["state"] not in ("CASH", "ASSIGNMENT_PENDING"):
-                used += 100.0 * (cyc.get("acquisition_price") or 0.0)
+                used += self._deliverable(cyc) * (cyc.get("acquisition_price") or 0.0)
         return used
 
     def _wheel_free(self):
         reserved = 0.0
         for cyc in self._active():
             if cyc["state"] in ("PUT_PENDING", "PUT_OPEN", "PUT_CLOSING"):
-                reserved += wheel.put_collateral(cyc["strike"], self.wheel_p)
+                reserved += self._reserved(cyc)
         return self.wheel_cash - reserved
 
     def _move(self, cyc, event):
@@ -727,9 +925,13 @@ class Simulator:
             "put_assignments": 0,
             "call_assignments": 0,
             "pnl": None,
+            "multiplier": 100.0,
+            "raw_priced": bool(best.get("raw_priced")),
+            "split_factor": best.get("split_factor") or 1.0,
         }
         self._move(cyc, "PUT_SUBMITTED")
         self._move(cyc, "PUT_FILLED")
+        self._note_trade(limit * 100.0)
         self._cash("WHEEL", round(limit * 100.0, 2), "sell_put", cyc)
         self._charge_option(cyc, "open")
         self.cycles.append(cyc)
@@ -752,6 +954,8 @@ class Simulator:
             "estimated": True,
             "option_prices": "ESTIMATED",
             "assignments": 0,
+            "raw_priced": bool(best.get("raw_priced")),
+            "multiplier": 100,
         })
         return True
 
@@ -768,7 +972,7 @@ class Simulator:
             ret = pct_return(closes, look)
             return (-(ret if ret is not None else -1e9), symbol)
 
-        ranked = sorted([s for s in self.cfg.wheel_symbols if s in self.hist], key=rank_key)
+        ranked = sorted([s for s in self.wheel_names if s in self.hist], key=rank_key)
         active = {c["symbol"] for c in self._active()}
         held = self._held_stock()
         for symbol in ranked:
@@ -781,6 +985,9 @@ class Simulator:
                 continue
             if symbol in held or symbol in self.bought_today:
                 self._count(symbol, "CROSS_BOOK_OVERLAP:STOCK")
+                continue
+            if self.put_trend_sma and not self._above_sma(symbol, today, self.put_trend_sma):
+                self._count(symbol, "RESEARCH_TREND_FILTER")
                 continue
             best, why = self._evaluate("put", symbol, today, now)
             if best is None:
@@ -820,6 +1027,12 @@ class Simulator:
         cyc["option_symbol"] = best["symbol"]
         cyc["sigma"] = best["sigma"]
         cyc["last_ask"] = best["ask"]
+        # A newly sold call is one listed 100-share contract. Shares left
+        # over after a split stay long and are not covered by this contract.
+        cyc["multiplier"] = 100.0
+        cyc["raw_priced"] = bool(best.get("raw_priced"))
+        cyc["split_factor"] = best.get("split_factor") or cyc.get("split_factor") or 1.0
+        self._note_trade(limit * 100.0)
         self._cash("WHEEL", round(limit * 100.0, 2), "sell_call", cyc)
         self._charge_option(cyc, "open")
         return True
@@ -828,7 +1041,9 @@ class Simulator:
         limit = wheel.tick_round_up(float(ask))
         if limit <= 0:
             return False
-        self._cash("WHEEL", -round(limit * 100.0, 2), "buy_to_close", cyc)
+        mult = self._deliverable(cyc)
+        self._note_trade(limit * mult)
+        self._cash("WHEEL", -round(limit * mult, 2), "buy_to_close", cyc)
         self._charge_option(cyc, "close")
         self._move(cyc, "BUYBACK_SUBMITTED")
         self._move(cyc, "BUYBACK_FILLED")
@@ -844,6 +1059,7 @@ class Simulator:
         if fill <= 0 or cyc["shares"] <= 0:
             return False
         self._move(cyc, "UNWIND_SUBMITTED")
+        self._note_trade(fill * cyc["shares"])
         self._cash("WHEEL", round(fill * cyc["shares"], 2), "unwind_sell", cyc)
         self._charge_stock("WHEEL", cyc)
         cyc["shares"] = 0
@@ -853,7 +1069,7 @@ class Simulator:
 
     def _manage_cycle(self, cyc, today, now):
         rec = self._research(cyc["symbol"], today)
-        px = self._spot(cyc["symbol"], today, "o")
+        px = self._cycle_spot(cyc, "o")
         if px is None:
             return
         bid, ask, mid, _quote = stock_quote(px, now)
@@ -890,21 +1106,30 @@ class Simulator:
 
     def _assign(self, cyc, today):
         self._charge_option(cyc, "assignment")
+        mult = self._deliverable(cyc)
         if cyc["kind"] == "put":
-            self._cash("WHEEL", -round(cyc["strike"] * 100.0, 2), "put_assignment", cyc)
+            self._note_trade(cyc["strike"] * mult)
+            self._cash("WHEEL", -round(cyc["strike"] * mult, 2), "put_assignment", cyc)
             self._charge_stock("WHEEL", cyc)
             self._move(cyc, "ASSIGNMENT_CONFIRMED")
-            cyc["shares"] = 100
+            cyc["shares"] = mult
             cyc["acquisition_price"] = cyc["strike"]
             cyc["put_assignments"] += 1
             self.put_assignments += 1
         else:
-            self._cash("WHEEL", round(cyc["strike"] * 100.0, 2), "call_assignment", cyc)
+            self._note_trade(cyc["strike"] * mult)
+            self._cash("WHEEL", round(cyc["strike"] * mult, 2), "call_assignment", cyc)
             self._charge_stock("WHEEL", cyc)
             self._move(cyc, "ASSIGNMENT_CONFIRMED")
-            cyc["shares"] = 0
+            cyc["shares"] = max(0.0, cyc["shares"] - mult)
             cyc["call_assignments"] += 1
             self.call_assignments += 1
+            # Live call assignment closes a cycle that held the 100 delivered
+            # shares. A split can leave extra shares. Those stay long. This
+            # is backtest accounting for the corporate action, not a new live
+            # transition.
+            if cyc["state"] == "CLOSED" and cyc["shares"] > 1e-6:
+                cyc["state"] = "SHARES_HELD"
         cyc["kind"] = None
         cyc["open_premium"] = None
         cyc["option_symbol"] = None
@@ -923,7 +1148,7 @@ class Simulator:
     def _settle_close(self, cyc, today):
         if cyc["state"] not in ("PUT_OPEN", "CALL_OPEN"):
             return
-        spot = self._spot(cyc["symbol"], today, "c")
+        spot = self._cycle_spot(cyc, "c")
         if spot is None:
             return
         if today >= cyc["expiry"]:
@@ -962,7 +1187,9 @@ class Simulator:
             ask = 0.0
             if cyc["state"] in ("PUT_OPEN", "CALL_OPEN"):
                 ask = cyc.get("last_ask") or 0.0
-            mtm = round(sum(f["amount"] for f in cyc["cashflows"]) + cyc["shares"] * bid - ask * 100.0, 2)
+            mtm = round(
+                sum(f["amount"] for f in cyc["cashflows"])
+                + cyc["shares"] * bid - ask * self._deliverable(cyc), 2)
             rows.append({
                 "book": "WHEEL", "id": cyc["id"], "symbol": cyc["symbol"], "state": cyc["state"],
                 "opened": cyc["opened"], "shares": cyc["shares"], "mtm_pnl": mtm, "estimated": True,
@@ -992,6 +1219,15 @@ class Simulator:
         trades = list(self.trades)
         costs = accounting.cost_overlay(
             self.option_sides, self.stock_txns, self.policy["costs"])
+        exposures = [point.get("exposure") or 0.0 for point in self.curve]
+        avg_exposure = (sum(exposures) / len(exposures)) if exposures else 0.0
+        avg_equity = (sum(point["equity"] for point in self.curve) / len(self.curve)) if self.curve else 0.0
+        start_d = date.fromisoformat(self.sessions[0])
+        end_d = date.fromisoformat(self.sessions[-1])
+        years = (end_d - start_d).days / 365.25
+        one_way = self.traded_dollars / 2.0
+        turnover = (one_way / avg_equity / years) if avg_equity and years > 0 else None
+        raw_names = [name for name in self.wheel_names if self._uses_raw(name)]
         return {
             "capital": self.capital,
             "stock_capital": round(self.stock_capital, 2),
@@ -1009,7 +1245,21 @@ class Simulator:
             "skips": self.skip_counts,
             "notionals": self._notional_summary(),
             "monthly_min_notional": self.monthly_min,
-            "experiment_block_date": self.risk.tripped_on,
+            "experiment_block_date": self.risk.first_trip,
+            "experiment_block_still_on": self.risk.experiment,
+            "dd_reset": self.dd_reset,
+            "dd_reset_count": self.risk.reset_count,
+            "dd_reset_dates": list(self.risk.reset_dates),
+            "fractional": self.fractional,
+            "share_rounding": "fractional_RESEARCH" if self.fractional else "whole_share",
+            "research_id": self.research_id,
+            "deploy": self.deploy,
+            "entry_frequency": self.entry_frequency,
+            "put_trend_sma": self.put_trend_sma,
+            "option_price_space": "unadjusted" if raw_names else "split_adjusted",
+            "traded_dollars": round(self.traded_dollars, 2),
+            "avg_exposure": avg_exposure,
+            "turnover": turnover,
             "daily_loss_sessions": self.risk.daily_blocks,
             "entry_block_sessions": self.block_sessions,
             "spy_blocked_sessions": self.spy_blocked,
@@ -1026,7 +1276,9 @@ class Simulator:
 
 def run_backtest(histories, cfg, *, start, end, capital, books=("stock", "wheel"),
                  slippage_bps=10.0, iv_haircut=0.10, earnings_provider=None,
-                 sessions=None):
+                 sessions=None, fractional=False, dd_reset=None, stock_params=None,
+                 wheel_params=None, wheel_symbols=None, put_trend_sma=None,
+                 entry_frequency="daily", research_id=None, deploy="policy"):
     """Run one path.
 
     `histories` maps a symbol to a History, and must include the bars the
@@ -1039,6 +1291,12 @@ def run_backtest(histories, cfg, *, start, end, capital, books=("stock", "wheel"
         raise ValueError("iv_haircut must be in [0, 1)")
     if slippage_bps < 0:
         raise ValueError("slippage_bps must be >= 0")
+    if dd_reset not in (None, "monthly"):
+        raise ValueError("dd_reset must be monthly or omitted")
+    if entry_frequency not in ("daily", "weekly"):
+        raise ValueError("entry_frequency must be daily or weekly")
+    if deploy not in ("policy", "stock", "wheel"):
+        raise ValueError("deploy must be policy, stock, or wheel")
     books = tuple(books)
     if not books or set(books) - {"stock", "wheel"}:
         raise ValueError("books must be stock, wheel, or both")
@@ -1062,7 +1320,10 @@ def run_backtest(histories, cfg, *, start, end, capital, books=("stock", "wheel"
     sim = Simulator(
         histories, calendar, window, cfg, capital=capital, books=books,
         slippage_bps=slippage_bps, iv_haircut=iv_haircut,
-        earnings_provider=earnings_provider)
+        earnings_provider=earnings_provider, fractional=fractional, dd_reset=dd_reset,
+        stock_params=stock_params, wheel_params=wheel_params, wheel_symbols=wheel_symbols,
+        put_trend_sma=put_trend_sma, entry_frequency=entry_frequency,
+        research_id=research_id, deploy=deploy)
     # Expiry must fall on a real bar date from the loaded history, not only
     # on the trading window. Replace the set the constructor derived.
     sim.real_sessions = set(full_dates)

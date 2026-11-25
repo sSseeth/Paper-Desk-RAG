@@ -746,6 +746,18 @@ def main(argv=None):
                     help="Skip the slippage and IV-haircut grid.")
     bt.add_argument("--skip-walk-forward", action="store_true",
                     help="Skip the chronological out-of-sample split.")
+    bt.add_argument("--strategies", default=None,
+                    help="RESEARCH candidates: all, shipped, momentum, trend, dual, "
+                         "wheel, stock_timeframe, benchmark, or a comma-separated list of ids. "
+                         "Omit this flag for the shipped desk report. "
+                         "Candidates do not change the live strategy.")
+    bt.add_argument("--fractional", action="store_true",
+                    help="RESEARCH. Allow fractional equity shares (Alpaca equities). "
+                         "The default is the live whole-share floor. Options stay one contract.")
+    bt.add_argument("--dd-reset", action="store_true",
+                    help="RESEARCH. Clear the 10% experiment block on the first session "
+                         "of the next month. The shipped block never clears. "
+                         "On --strategies all the grid already contains shipped_dd_reset.")
     a = ap.parse_args(argv)
     # Backtest has no --account. It must be dispatched before that lookup.
     if a.cmd == "backtest":
