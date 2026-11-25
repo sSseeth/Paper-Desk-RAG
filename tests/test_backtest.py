@@ -5,10 +5,11 @@ from datetime import date, timedelta
 import pytest
 
 from sakibdesk import accounting, stock, wheel
-from sakibdesk.backtest.cli import default_capitals, parse_books, parse_capitals, run_cli
+from sakibdesk.backtest.cli import decorate, default_capitals, parse_books, parse_capitals, run_cli
 from sakibdesk.backtest.data import Bar, CredentialsMissing, History, cache_path, load_csv, write_csv
 from sakibdesk.backtest.engine import RiskBook, run_backtest, split_sessions
-from sakibdesk.backtest.metrics import summarise
+from sakibdesk.backtest.metrics import equal_weight, summarise
+from sakibdesk.backtest.report import capital_skips, render_markdown
 from sakibdesk.backtest.pricing import bs_price, early_exercise, quoted
 from sakibdesk.backtest.report import JSON_NAME, MD_NAME
 from sakibdesk.config import Config
@@ -68,9 +69,96 @@ def test_config_hash_is_unchanged():
 
 def test_default_capitals_include_the_paper_book():
     capitals = default_capitals(100000.0)
-    assert capitals == [2000.0, 5000.0, 10000.0, 25000.0, 100000.0]
+    assert capitals == [100.0, 300.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 25000.0, 100000.0]
     assert parse_capitals("2000, 2000, 5000", 100000.0) == [2000.0, 5000.0]
     assert parse_books("wheel,stock,wheel") == ("wheel", "stock")
+
+
+def test_low_capital_counts_skips_and_does_not_crash():
+    """$100 to $1,000 cannot buy one share of this series. The run still reports."""
+    dates, histories = _stock_case()
+    day = dates[-1]
+    cfg = _cfg()
+    runs = []
+    for capital in (100.0, 300.0, 500.0, 1000.0):
+        result = run_backtest(
+            histories, cfg, start=day, end=day, capital=capital, books=("stock", "wheel"),
+            slippage_bps=10.0, iv_haircut=0.10)
+        decorate(result, histories, cfg)
+        skipped = capital_skips(result)
+        assert skipped["stock"] > 0
+        assert skipped["total"] == skipped["stock"] + skipped["wheel"]
+        assert result["skips"]["MU"]["insufficient_capital"] == skipped["stock"]
+        for trade in result["trades"]:
+            assert isinstance(trade["qty"], int) and trade["qty"] >= 1
+            if trade["book"] == "WHEEL":
+                assert trade["qty"] == 1
+        # The policy overlay is not charged on an order that never opened.
+        assert result["costs"]["stock_transactions"] == 0
+        assert result["metrics"]["combined"]["win_rate"] is None
+        assert result["metrics"]["combined"]["total_return"] is not None
+        runs.append(result)
+    text = render_markdown({
+        "config_hash": HASH, "strategy_version": cfg.strategy_version,
+        "start": day, "end": day, "assumptions": [], "limitations": [],
+        "coverage": {"missing_symbols": [], "alerts_only": []},
+        "runs": runs, "sensitivity": [], "walk_forward": None,
+    })
+    assert "Capital skips by starting capital" in text
+    for label in ("100.00", "300.00", "500.00", "1,000.00"):
+        assert label in text
+
+
+def _quiet(dates, start, step, wick):
+    bars, px = [], start
+    for day in dates:
+        o = px
+        c = px + step
+        bars.append(Bar(day, o, max(o, c) + wick, min(o, c) - wick, c, 1000))
+        px = c
+    return bars
+
+
+def test_small_account_buys_whole_shares_and_slippage_scales():
+    dates = _dates(241)
+    histories = _hist(("MU", _quiet(dates, 1.5, 0.01, 0.002)), ("SPY", _trend(dates)))
+    day = dates[-1]
+    cfg = _cfg()
+    result = run_backtest(
+        histories, cfg, start=day, end=day, capital=100.0, books=("stock", "wheel"),
+        slippage_bps=10.0, iv_haircut=0.10)
+    stock_trades = [t for t in result["trades"] if t["book"] == "STOCK"]
+    assert stock_trades, result["skips"]
+    trade = stock_trades[0]
+    assert isinstance(trade["qty"], int) and trade["qty"] >= 1
+    # 20% sleeve is $20. One whole share plus the $1 overlay has to fit.
+    assert trade["qty"] * trade["entry_price"] + cfg.policy["costs"]["overlay_per_stock_transaction"] <= 20.0 + 0.05
+    bare = stock.round_px(trade["entry_price"] / 1.001)
+    # 10 bps is a fraction of price, not a flat dollar larger than the share.
+    assert trade["entry_price"] - bare < 0.05
+    assert result["costs"]["total"] == accounting.cost_overlay(
+        result["costs"]["option_sides"], result["costs"]["stock_transactions"], cfg.policy["costs"])
+    assert result["costs"]["stock_transactions"] >= 1
+    for wheel_trade in result["trades"]:
+        if wheel_trade["book"] == "WHEEL":
+            assert wheel_trade["qty"] == 1
+
+
+def test_empty_and_zero_equity_metrics_do_not_crash():
+    flat = summarise(100.0, "2024-01-02", [], [])
+    assert flat["trades"] == 0 and flat["win_rate"] is None
+    assert flat["total_return"] == 0.0
+    assert flat["annualised_return"] is None
+    wiped = summarise(100.0, "2024-01-01", [
+        {"date": "2024-01-02", "equity": 0.0},
+        {"date": "2024-01-03", "equity": None},
+    ], [])
+    assert wiped["annualised_return"] is None
+    assert wiped["max_drawdown"] == 1.0
+    assert wiped["total_return"] == -1.0
+    held = equal_weight(100.0, [{"symbol": "X", "entry": 500.0, "exit": 400.0}], 1.0)
+    assert held["symbols"][0]["qty"] == 0
+    assert held["total_return"] == 0.0
 
 
 def test_risk_book_matches_risk_state(cfg, journal):

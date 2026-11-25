@@ -270,7 +270,7 @@ Wheel prices are estimates. The report labels them ESTIMATED. A cache of CSV bar
 py desk.py backtest --start 2021-01-04 --end 2026-01-02 --output-dir reports\backtest --fetch
 ```
 
-`--capital` accepts a comma-separated list. The default list is 2000, 5000, 10000, 25000, and the configured paper capital. `--books` is `stock`, `wheel`, or `stock,wheel`.
+`--capital` accepts a comma-separated list. The default list is 100, 300, 500, 1000, 2000, 5000, 10000, 25000, and the configured paper capital. Sizing stays in whole shares, the same floor `stock.size` uses, and a wheel entry is one contract. A name that cannot fund one share, or one contract, plus the policy overlay is skipped and counted at that capital. Slippage stays in basis points, so the dollar slippage scales with the fill. `--books` is `stock`, `wheel`, or `stock,wheel`.
 
 The report is a point-in-time calculation with these limits:
 

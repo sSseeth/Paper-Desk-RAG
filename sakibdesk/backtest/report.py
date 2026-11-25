@@ -18,7 +18,10 @@ from sakibdesk.backtest.pricing import (
 
 JSON_NAME = "backtest_report.json"
 MD_NAME = "backtest_report.md"
-CAPITAL_REASONS = ("notional_cap", "insufficient_cash", "combined_cap")
+# Wheel refusals after a contract passed the screen, plus a stock entry whose
+# live floor (or the policy overlay on top of that floor) cannot buy one share.
+WHEEL_CAPITAL_REASONS = ("notional_cap", "insufficient_cash", "combined_cap")
+STOCK_CAPITAL_REASONS = ("insufficient_capital",)
 
 ASSUMPTIONS = [
     "Wheel premiums are European Black-Scholes estimates on realised volatility. "
@@ -62,9 +65,15 @@ ASSUMPTIONS = [
     "One decision is taken per session, inside each book's entry window. "
     "Stock uses 45 minutes after the open. The wheel uses 120 minutes after the "
     "open. Stops and targets are treated as resting all day.",
-    "Commissions are the policy overlays: one currency unit per stock transaction "
-    "and per option side, including expiry and assignment. Alpaca paper fills "
-    "are not used.",
+    "Shares are whole. Quantity is stock.size, which floors, and the fee loop "
+    "only steps down by one share. The wheel sells one contract. There is no "
+    "fractional share and no fractional contract.",
+    "Commissions are the policy overlays: one currency unit per stock "
+    "transaction and per option side, including expiry and assignment. The "
+    "overlay is not scaled down at a small account. Slippage is basis points "
+    "of the fill, so the dollar amount scales with price. A fill that cannot "
+    "pay one whole share plus the overlay is skipped and counted. A skipped "
+    "order is not charged. Alpaca paper fills are not used.",
     "Base for the percent limits is min(scenario starting capital, last marked "
     "equity). The percents are the policy percents. Sleeve cash starts at the "
     "policy stock/wheel ratio of the scenario capital. policy.json is not edited.",
@@ -115,15 +124,22 @@ def money(value):
 
 
 def capital_skips(run):
-    """Counts of wheel entries the screen passed and capital then refused."""
-    total = 0
+    """Skipped entries that failed for capital, by book and by symbol.
+
+    Stock: the live size floor, or the policy overlay on that floor, left no
+    whole share. Wheel: the screen accepted a contract and cash or a notional
+    cap then refused it. Counts are for this run's starting capital.
+    """
+    stock = wheel = 0
     by_symbol = {}
     for symbol, reasons in (run.get("skips") or {}).items():
-        count = sum(reasons.get(name, 0) for name in CAPITAL_REASONS)
-        if count:
-            by_symbol[symbol] = count
-            total += count
-    return total, by_symbol
+        s = sum(int(reasons.get(name) or 0) for name in STOCK_CAPITAL_REASONS)
+        w = sum(int(reasons.get(name) or 0) for name in WHEEL_CAPITAL_REASONS)
+        stock += s
+        wheel += w
+        if s or w:
+            by_symbol[symbol] = {"stock": s, "wheel": w, "total": s + w}
+    return {"stock": stock, "wheel": wheel, "total": stock + wheel, "by_symbol": by_symbol}
 
 
 def headline_row(run):
@@ -142,7 +158,7 @@ def headline_row(run):
         "worst_month_return": metrics["worst_month_return"],
         "spy_return": (bench.get("spy") or {}).get("total_return"),
         "equal_weight_return": (bench.get("equal_weight") or {}).get("total_return"),
-        "wheel_capital_skips": capital_skips(run)[0],
+        "capital_skips": capital_skips(run),
         "put_assignments": run["assignments"]["put"],
         "call_assignments": run["assignments"]["call"],
     }
@@ -177,20 +193,22 @@ def render_markdown(report):
     lines.append("")
     lines.append(
         "| Capital | Total | Ann. | Max DD | Sharpe | Sortino | Win rate | "
-        "Trades | Worst month | SPY | Equal-weight | Wheel capital skips |")
+        "Trades | Worst month | SPY | Equal-weight | Capital skips |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for run in report["runs"]:
         row = headline_row(run)
         worst = row["worst_month"] or "n/a"
         if row["worst_month_return"] is not None:
             worst = f"{worst} ({pct(row['worst_month_return'])})"
+        skipped = row["capital_skips"]["total"]
         lines.append(
             f"| {money(row['capital'])} | {pct(row['total_return'])} | "
             f"{pct(row['annualised_return'])} | {pct(row['max_drawdown'])} | "
             f"{num(row['sharpe'])} | {num(row['sortino'])} | {pct(row['win_rate'])} | "
             f"{row['trades']} | {worst} | {pct(row['spy_return'])} | "
-            f"{pct(row['equal_weight_return'])} | {row['wheel_capital_skips']} |")
+            f"{pct(row['equal_weight_return'])} | {skipped} |")
     lines.append("")
+    lines.extend(_capital_skip_section(report))
     lines.append("## Books")
     lines.append("")
     lines.append(
@@ -256,6 +274,29 @@ def _primary(report):
     return runs[-1] if runs else None
 
 
+def _capital_skip_section(report):
+    """One row per starting capital. Empty runs still render a zero."""
+    lines = ["## Capital skips by starting capital", ""]
+    lines.append(
+        "A skip is an entry the rules reached and then refused because the "
+        "account could not fund it. Stock: `stock.size` floored to no share, "
+        "or one share plus the policy overlay did not fit in the sleeve. "
+        "Wheel: the estimated contract passed the screen, then cash or the "
+        "notional cap refused it. Skipped orders are not charged a fee.")
+    lines.append("")
+    lines.append("| Capital | Stock whole-share skips | Wheel capital skips | Total |")
+    lines.append("| --- | --- | --- | --- |")
+    for run in report.get("runs") or []:
+        skipped = capital_skips(run)
+        lines.append(
+            f"| {money(run.get('capital'))} | {skipped['stock']} | "
+            f"{skipped['wheel']} | {skipped['total']} |")
+    if not report.get("runs"):
+        lines.append("| n/a | 0 | 0 | 0 |")
+    lines.append("")
+    return lines
+
+
 def _notional_section(run):
     lines = ["## Wheel capital", ""]
     lines.append(
@@ -266,16 +307,19 @@ def _notional_section(run):
         "policy notional cap then refused. They are not the same as a day the "
         "screen found nothing.")
     lines.append("")
-    lines.append("| Symbol | Days with a contract | Min 100×strike | Median | Max | Capital skips |")
+    lines.append("| Symbol | Days with a contract | Min 100×strike | Median | Max | Wheel capital skips |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
-    _total, by_symbol = capital_skips(run)
+    skipped = capital_skips(run)
+    by_symbol = skipped["by_symbol"]
     for symbol, stats in sorted((run.get("notionals") or {}).items()):
+        wheel_n = (by_symbol.get(symbol) or {}).get("wheel", 0)
         lines.append(
             f"| {symbol} | {stats['days']} | {money(stats['min'])} | "
-            f"{money(stats['median'])} | {money(stats['max'])} | "
-            f"{by_symbol.get(symbol, 0)} |")
+            f"{money(stats['median'])} | {money(stats['max'])} | {wheel_n} |")
     lines.append("")
-    lines.append(f"Wheel entries skipped for capital in this run: {_total}.")
+    lines.append(
+        f"Wheel entries skipped for capital in this run: {skipped['wheel']}. "
+        f"Stock entries skipped because one whole share did not fit: {skipped['stock']}.")
     lines.append("")
     if run.get("experiment_block_date"):
         lines.append(
@@ -350,13 +394,13 @@ def _sensitivity_section(rows):
         "This is not a search for a better parameter. The shipped policy does "
         "not change.")
     lines.append("")
-    lines.append("| Slippage bps | IV haircut | Total | Max DD | Sharpe | Trades | Wheel capital skips |")
+    lines.append("| Slippage bps | IV haircut | Total | Max DD | Sharpe | Trades | Capital skips |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for row in rows:
         lines.append(
             f"| {row['slippage_bps']:g} | {row['iv_haircut']:.0%} | "
             f"{pct(row['total_return'])} | {pct(row['max_drawdown'])} | "
-            f"{num(row['sharpe'])} | {row['trades']} | {row['wheel_capital_skips']} |")
+            f"{num(row['sharpe'])} | {row['trades']} | {row['capital_skips']} |")
     lines.append("")
     return lines
 

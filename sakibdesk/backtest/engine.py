@@ -384,6 +384,15 @@ class Simulator:
             self.stock_cash + self.wheel_cash, stock_rows + wheel_rows, options)
         stock_eq = accounting.conservative_equity(self.stock_cash, stock_rows, [])
         wheel_eq = accounting.conservative_equity(self.wheel_cash, wheel_rows, options)
+        # A missing bid would make the live mark None. The curve still needs a
+        # number: fall back to cash so a small account does not crash the report.
+        cash = round(self.stock_cash + self.wheel_cash, 2)
+        if total is None:
+            total = cash
+        if stock_eq is None:
+            stock_eq = round(self.stock_cash, 2)
+        if wheel_eq is None:
+            wheel_eq = round(self.wheel_cash, 2)
         return total, stock_eq, wheel_eq
 
     # ---------------------------------------------------------------- stock
@@ -487,18 +496,20 @@ class Simulator:
         if not ok:
             self._count(symbol, "quote")
             return
-        if abs(ask / cand["signal_close"] - 1) > self.stock_p["ask_band_pct"]:
+        close = cand["signal_close"]
+        if close is None or close <= 0 or abs(ask / close - 1) > self.stock_p["ask_band_pct"]:
             self._count(symbol, "ask_band")
             return
         fill = stock.round_px(ask * (1.0 + self.slip))
         if fill <= 0 or cand["R"] is None or cand["R"] <= 0:
-            self._count(symbol, "zero_size")
+            self._count(symbol, "insufficient_capital")
             return
-        qty = stock.size(base, fill, cand["R"], self.stock_cash, self.stock_p)
+        # stock.size floors. The fee loop steps by one share. Never a fraction.
+        qty = int(stock.size(base, fill, cand["R"], self.stock_cash, self.stock_p))
         while qty > 0 and qty * fill + self.stock_comm > self.stock_cash + 1e-9:
             qty -= 1
         if qty <= 0:
-            self._count(symbol, "zero_size")
+            self._count(symbol, "insufficient_capital")
             return
         _body, stop, target = stock.bracket_body(symbol, qty, fill, cand["R"], self.stock_p)
         self._stock_n += 1

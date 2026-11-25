@@ -726,8 +726,8 @@ def main(argv=None):
     bt.add_argument("--start", required=True, help="First session date (YYYY-MM-DD).")
     bt.add_argument("--end", required=True, help="Last session date (YYYY-MM-DD).")
     bt.add_argument("--capital", default=None,
-                    help="Comma-separated starting capitals. Default: 2000,5000,10000,25000 and the "
-                         "configured paper capital.")
+                    help="Comma-separated starting capitals. Default: 100,300,500,1000,2000,5000,"
+                         "10000,25000 and the configured paper capital.")
     bt.add_argument("--books", default="stock,wheel",
                     help="stock, wheel, or stock,wheel. Default: both.")
     bt.add_argument("--output-dir", default=None,

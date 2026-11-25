@@ -30,8 +30,12 @@ GRID_IV_HAIRCUT = (0.0, 0.10, 0.25)
 
 
 def default_capitals(policy_initial):
-    """Starting capitals the report covers, including the configured paper capital."""
-    values = [2000.0, 5000.0, 10000.0, 25000.0, float(policy_initial)]
+    """Starting capitals the report covers, including the configured paper capital.
+
+    The low levels ($100, $300, $500, $1,000) are there so a small account is
+    visible. They use the same percents and the same whole-share sizing.
+    """
+    values = [100.0, 300.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 25000.0, float(policy_initial)]
     out = []
     for value in values:
         if value not in out:
@@ -217,7 +221,9 @@ def _slim(raw):
         "trades": metrics["trades"],
         "worst_month": metrics["worst_month"],
         "worst_month_return": metrics["worst_month_return"],
-        "wheel_capital_skips": capital_skips(raw)[0],
+        "capital_skips": capital_skips(raw)["total"],
+        "stock_capital_skips": capital_skips(raw)["stock"],
+        "wheel_capital_skips": capital_skips(raw)["wheel"],
         "assignments": raw["assignments"],
         "metrics": raw["metrics"],
     }

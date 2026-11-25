@@ -82,13 +82,19 @@ def summarise(start_equity, start_date, curve, trades):
     """Summary statistics for one equity curve and its closed trades.
 
     `curve` is a list of {date, equity} session closes. The start point is
-    prepended so the first day's move is included.
+    prepended so the first day's move is included. An empty curve, a missing
+    mark, or a non-positive starting equity does not raise.
     """
+    if not start_equity or start_equity < 0:
+        start_equity = 0.0
     dates = [start_date]
-    equities = [start_equity]
-    for point in curve:
-        dates.append(point["date"])
-        equities.append(point["equity"])
+    equities = [float(start_equity)]
+    for point in curve or []:
+        dates.append(point.get("date") or start_date)
+        equity = point.get("equity")
+        if equity is None:
+            equity = equities[-1]
+        equities.append(float(equity))
     end_equity = equities[-1]
     total = (end_equity / start_equity - 1.0) if start_equity else None
     rets = _returns(equities)
@@ -120,13 +126,20 @@ def summarise(start_equity, start_date, curve, trades):
 
 
 def round_trip(capital, entry, exit_px, cost):
-    """Buy-and-hold of one name, entry and exit both charged `cost`."""
+    """Buy-and-hold of one name, entry and exit both charged `cost`.
+
+    Quantity is the live whole-share floor. A sleeve that cannot buy one
+    share keeps its cash and is not charged.
+    """
+    if not capital or capital <= 0 or not entry or entry <= 0:
+        return {"qty": 0, "end_equity": capital, "total_return": None}
     held = accounting.buy_and_hold(capital, entry, cost)
-    end = accounting.bh_value(held, exit_px)
-    if held["qty"]:
-        end = round(end - cost, 2)
-    ret = (end / capital - 1.0) if capital else None
-    return {"qty": held["qty"], "end_equity": end, "total_return": ret}
+    qty = held["qty"] if held["qty"] and held["qty"] > 0 else 0
+    if qty <= 0:
+        return {"qty": 0, "end_equity": round(float(capital), 2), "total_return": 0.0}
+    end = accounting.bh_value({"qty": qty, "cash": held["cash"]}, exit_px)
+    end = round(end - cost, 2)
+    return {"qty": qty, "end_equity": end, "total_return": end / capital - 1.0}
 
 
 def equal_weight(capital, names, cost):
@@ -137,12 +150,16 @@ def equal_weight(capital, names, cost):
     """
     if not names or capital <= 0:
         return {"symbols": [], "end_equity": None, "total_return": None, "excluded": []}
-    each = capital / len(names)
+    each = capital / float(len(names))
     end = 0.0
     rows = []
     for name in names:
-        held = round_trip(each, name["entry"], name["exit"], cost)
-        end += held["end_equity"]
+        entry = name.get("entry") or 0.0
+        exit_px = name.get("exit")
+        if exit_px is None:
+            exit_px = entry
+        held = round_trip(each, entry, exit_px, cost)
+        end += held["end_equity"] if held["end_equity"] is not None else 0.0
         rows.append({"symbol": name["symbol"], **held})
     return {
         "symbols": rows,
